@@ -157,7 +157,14 @@ def smoke_test() -> dict:
     run = wandb.init(
         project="causal-steering",
         job_type="smoke",
-        config={"layer": 26, "stage": "week1_plumbing", "tap": "blocks[26].output[0]"},
+        config={
+            "layer": 26,
+            "stage": "week1_plumbing",
+            "tap": "blocks[26].output[0]",
+            # Tagged for the (dtype × sequence) ablation in docs/goodfire_query.md.
+            "sae_dtype": "bfloat16",
+            "input_seq": "brca1_nm_007294.4_1-1500",
+        },
         reinit=True,
     )
 
