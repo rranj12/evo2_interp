@@ -26,7 +26,7 @@ Confirm dates against actual CFPs before locking submission targets.
 
 ## Phase timeline
 
-### Week 1 — Infra + data plumbing
+### Week 1 — Infra + data plumbing ✓ *(plumbing green; recon quality TBD)* [^w1-recon]
 **Goal:** Smoke test passes end-to-end on synthetic input. Codebase is gene-agnostic from day one.
 - Repo scaffold, `pyproject.toml`, Hydra configs, W&B project.
 - Modal app + Volume; cache Evo 2 + Goodfire SAE weights.
@@ -35,6 +35,14 @@ Confirm dates against actual CFPs before locking submission targets.
 - `scripts/smoke_test.py`: 1 variant → Evo 2 → SAE encode/decode → log activations. No steering yet.
 
 **Done:** smoke test green; W&B run shows non-empty activations + reconstruction error < threshold. Loaders accept `gene=BRCA1|TP53|PPARG` as a config flag.
+
+[^w1-recon]: Reconstruction relative L2 is not yet under the original 0.2 plumbing
+gate. A (dtype × sequence) ablation is logged in `docs/goodfire_query.md`. We have
+ruled out tap-point, SAE math, and model-variant bugs; the remaining hypothesis is
+an SAE-input-distribution mismatch on the Goodfire checkpoint. Open question is
+parked with Goodfire/Arc — proceeding to Phase 0 since the relevant property for
+discovery is *feature consistency*, not absolute recon. Will revisit if Phase 0
+probe AUC underperforms.
 
 ### Week 2 — Phase 0: Feature discovery (BRCA1)
 **Goal:** Validate the discovery pipeline on the gene with the most signal.
