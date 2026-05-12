@@ -1,0 +1,6 @@
+defaults:
+  - base
+  - _self_
+
+feature_mask_path: runs/phase0/${gene}/feature_mask.json
+output_dir: runs/steering/${gene}/seed_${seed}

@@ -1,0 +1,45 @@
+gene: BRCA1
+seed: 42
+layer: 26
+
+evo2:
+  model_id: arcinstitute/evo2_7b
+  device: cuda
+  max_new_tokens: 512
+
+sae:
+  model_id: Goodfire/Evo-2-Layer-26-Mixed
+
+probe:
+  feature_mask_size: 100
+  cv_folds: 5
+  max_iter: 1000
+  C: 1.0
+
+steering:
+  n_iterations: 200
+  n_warmup: 10
+  eps: 0.001
+  guard_quantile_low: 0.01
+  guard_quantile_high: 0.99
+
+gp:
+  bounds_low: 0.0
+  bounds_high: 3.0
+
+acquisition:
+  xi: 0.01
+
+reward:
+  am_weight: 0.5
+  cadd_weight: 0.5
+
+data:
+  clinvar_path: data/clinvar_${gene}.tsv
+  mave_path: data/mave_${gene}.csv
+  alphamissense_path: data/alphamissense_scores.parquet
+  cadd_path: data/cadd_scores.tsv.gz
+
+wandb:
+  project: causal-steering
+  entity: null

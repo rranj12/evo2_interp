@@ -1,0 +1,6 @@
+defaults:
+  - base
+  - _self_
+
+atlas_path: runs/steering/${gene}/seed_0/atlas.json
+output_dir: runs/eval/${gene}

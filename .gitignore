@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+.env
+
+# Data and run outputs — use Modal Volume
+data/
+runs/
+*.parquet
+*.tsv.gz
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# W&B
+wandb/
