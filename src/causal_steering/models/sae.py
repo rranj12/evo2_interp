@@ -44,7 +44,6 @@ from pathlib import Path
 
 import torch
 
-
 SAE_TOPK_DEFAULT = 64
 SAE_FILENAME = "sae-layer26-mixed-expansion_8-k_64.pt"
 
@@ -57,7 +56,7 @@ class BatchTopKSAE:
         model_id: str,
         device: str = "cuda",
         k: int = SAE_TOPK_DEFAULT,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """
         Load and freeze a tied-weight BatchTopK SAE.
@@ -65,10 +64,9 @@ class BatchTopKSAE:
         Tied weights: a single matrix `W` is used as the encoder weight; the
         decoder uses `W.T`. Only one matrix is stored on disk.
 
-        Default dtype is float32 for numerical headroom in the
-        large-matmul `f @ W.T` decode step. The encode method casts the
-        input tensor to `self.W.dtype`, so feeding bf16 Evo 2 activations
-        works transparently.
+        Default dtype is bfloat16 to match Evo 2's activation dtype. An earlier
+        fp32 cast was tried as a numerical-headroom hedge but made recon worse
+        on real BRCA1 input — see `docs/goodfire_query.md` for the ablation.
         """
         self.device = device
         self.dtype = dtype
