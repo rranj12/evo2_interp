@@ -10,6 +10,9 @@ The Evo 2 paper. 7B-param genomic foundation model trained on 9.3T nucleotides a
 **Goodfire, 2025.** "Interpreting Evo 2." Technical Report.
 Trains BatchTopK SAEs on Evo 2 internals, discovers interpretable biological features (coding sequences, protein secondary structure, tRNA motifs). Provides the SAE weights this project uses (`Goodfire/Evo-2-Layer-26-Mixed`, HuggingFace, MIT license). **Their work is descriptive; ours is functional.**
 
+**Arc Institute, 2026.** Canonical SAE loading + inference notebook.
+[`notebooks/sparse_autoencoder/sparse_autoencoder.ipynb`](https://github.com/ArcInstitute/evo2/blob/main/notebooks/sparse_autoencoder/sparse_autoencoder.ipynb) in the `ArcInstitute/evo2` repo. Source of truth for: (1) `BatchTopKTiedSAE` class with the exact encode/decode math (no pre-centering, ReLU-then-BatchTopK with *global* flatten across batch×seq), (2) tap point — `'blocks-26'` in the notebook's dash-separated module map, i.e. a manual `register_forward_hook` on `model.blocks[26]` capturing `output[0]`, (3) no preprocessing applied to activations before encoding. **`ACTIVATION_SCALING_CONSTANT = 2.742…` appears in the notebook but is commented out — vestigial.**
+
 **Markov Bio, 2026.** "Through a Glass Darkly: Mechanistic Interpretability as the Bridge to End-to-End Biology." Blog/preprint.
 Argues that the path from interpretability to utility requires *causal* interventions, not just descriptive feature identification. The motivating critique for this project.
 
