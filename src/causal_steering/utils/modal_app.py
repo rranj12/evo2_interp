@@ -39,6 +39,9 @@ weights_volume = modal.Volume.from_name(
 WEIGHTS_ROOT = Path("/weights")
 EVO2_DIR = WEIGHTS_ROOT / "evo2_7b"
 SAE_DIR = WEIGHTS_ROOT / "evo2_layer26_sae"
+CLINVAR_DIR = WEIGHTS_ROOT / "clinvar"
+CLINVAR_PATH = CLINVAR_DIR / "variant_summary.txt.gz"
+REFERENCE_DIR = WEIGHTS_ROOT / "reference" / "grch38"
 
 # Single source of truth for model IDs. Loaders import these.
 EVO2_REPO_ID = "arcinstitute/evo2_7b"
@@ -63,6 +66,14 @@ gpu_image = (
     # Project's other deps (botorch, hydra, wandb, etc.); torch>=2.3 already satisfied.
     .pip_install_from_pyproject("pyproject.toml")
     .env({"HF_HOME": "/weights/.hf_cache"})
+    # Ship Hydra configs into the container so functions can compose() inside.
+    # MUST be the last image step: Modal forbids further build steps after a
+    # lazy `add_local_*` call (the alternative is `copy=True`, but configs/ is
+    # tiny and changes often, so the lazy mount is correct here).
+    .add_local_dir(
+        str(Path(__file__).resolve().parents[3] / "configs"),
+        "/configs",
+    )
 )
 
 
@@ -120,6 +131,70 @@ def cache_weights(force: bool = False) -> dict[str, str]:
     weights_volume.commit()
 
     return {"evo2_dir": str(EVO2_DIR), "sae_dir": str(SAE_DIR)}
+
+
+# ---------------------------------------------------------------------------
+# ClinVar caching (run once; idempotent)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 15,
+)
+def cache_clinvar(force: bool = False) -> str:
+    """
+    Snapshot NCBI ClinVar `variant_summary.txt.gz` into /weights/clinvar.
+
+    Idempotent: skips if the file is already on the Volume unless force=True.
+    Returns the on-Volume path. Phase 0 reads from here on Modal; the laptop
+    path in configs/base.yaml is overridden at dispatch time.
+    """
+    from causal_steering.data.clinvar import download_clinvar_summary
+
+    CLINVAR_DIR.mkdir(parents=True, exist_ok=True)
+    if CLINVAR_PATH.exists() and not force:
+        print(f"[cache_clinvar] already cached at {CLINVAR_PATH}")
+    else:
+        print(f"[cache_clinvar] downloading → {CLINVAR_PATH}")
+        download_clinvar_summary(CLINVAR_PATH)
+        weights_volume.commit()
+    return str(CLINVAR_PATH)
+
+
+# ---------------------------------------------------------------------------
+# GRCh38 reference caching (per-chromosome lazy fetch; idempotent)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 30,
+)
+def cache_reference(gene: str = "BRCA1") -> str:
+    """
+    Snapshot just the GRCh38 chromosomes that `gene`'s 2-star ClinVar variants
+    touch onto `/weights/reference/grch38/`. Idempotent.
+
+    Per-chromosome lazy fetch: BRCA1+TP53+PPARG together only need chr3 and
+    chr17, so we never pay for the ~3 GB whole-genome download.
+    """
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import ensure_chromosomes
+
+    cache_clinvar.local(force=False)
+
+    df = load_clinvar(CLINVAR_PATH, gene=gene)
+    chroms = sorted(set(df["chrom"].astype(str)))
+    print(f"[cache_reference] {gene} variants span chroms: {chroms}")
+
+    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    paths = ensure_chromosomes(chroms, REFERENCE_DIR)
+    weights_volume.commit()
+    print(f"[cache_reference] reference ready at {REFERENCE_DIR}: {[p.name for p in paths]}")
+    return str(REFERENCE_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +505,79 @@ def probe_hook_vs_vortex() -> dict:
     import json
     print(json.dumps(out, indent=2))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 entrypoint
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 60 * 4,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def phase0(gene: str = "BRCA1") -> dict:
+    """
+    Phase 0 end-to-end on Modal for one gene.
+
+      modal run -m causal_steering.utils.modal_app::phase0 --gene BRCA1
+
+    Idempotently caches Evo 2 + SAE + ClinVar onto the Volume, composes the
+    Hydra `phase0` config inside the container with `gene=<gene>`, rewrites the
+    on-Volume paths (clinvar, evo2 weights, output dir), then dispatches to
+    `causal_steering.phase0.run_phase0`. Outputs land at
+    `/weights/runs/phase0/<gene>/{feature_mask.json, guard.npz}` and the
+    probe CV AUC is logged to W&B.
+    """
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from causal_steering.phase0 import run_phase0
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    # Configs are mounted at /configs by gpu_image.add_local_dir(...).
+    with initialize_config_dir(config_dir="/configs", version_base=None):
+        cfg = compose(config_name="phase0", overrides=[f"gene={gene}"])
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(cfg_dict, dict)
+
+    cfg_dict.setdefault("data", {})["clinvar_path"] = str(CLINVAR_PATH)
+    cfg_dict["data"]["reference_path"] = str(REFERENCE_DIR)
+    # Leave `evo2.local_path` as None (base.yaml default). The configured model
+    # is `evo2_7b_262k` (MLP intermediate 11264), but cache_weights fetches the
+    # standard `evo2_7b` (11008) into EVO2_DIR — different checkpoints. Pointing
+    # local_path at the cached file mis-loads weights into the 262k architecture
+    # and trips a state_dict size mismatch. The evo2 package will fetch the
+    # correct 262k weights via HF_HOME (on the Volume) on first call.
+    out_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    cfg_dict["output_dir"] = str(out_dir)
+
+    result = run_phase0(cfg_dict)
+    weights_volume.commit()
+
+    auc = result.get("cv_auc_mean")
+    if auc is None:
+        # run_phase0 bails out early when sequence context isn't populated
+        # (ROADMAP Week 2 follow-up). Surface that instead of pretending PASS.
+        reason = result.get("reason", "no AUC produced")
+        print(f"\n[phase0] SKIPPED: {reason}")
+    elif auc > 0.85:
+        print(f"\nPASS: probe AUC {auc:.3f} > 0.85")
+    elif auc >= 0.70:
+        print(f"\nWARN: probe AUC {auc:.3f}, below 0.85 target")
+    else:
+        print(f"\nFAIL: probe AUC {auc:.3f}, see ROADMAP risk log")
+
+    return {**result, "output_dir": str(out_dir)}
 
 
 # ---------------------------------------------------------------------------
