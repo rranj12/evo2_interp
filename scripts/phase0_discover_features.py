@@ -1,64 +1,41 @@
-"""Phase 0: discover pathogenicity-discriminative SAE features for a gene."""
-from pathlib import Path
+"""
+Thin Hydra wrapper around `causal_steering.phase0.run_phase0`.
+
+The orchestration body lives in the package (so Modal can import it without
+needing `scripts/` mounted in the image). This entrypoint just:
+  1. Resolves the Hydra config to a plain Python dict (local path).
+  2. Dispatches locally or to Modal based on `cfg.remote` (default: local).
+
+On the remote path, the Modal entrypoint re-composes the config itself from
+`/configs` and accepts only `gene` — any Hydra overrides passed here are
+ignored remotely. For non-default overrides remotely, edit configs/phase0.yaml.
+
+Usage:
+  python scripts/phase0_discover_features.py --config-name=phase0 gene=BRCA1
+  python scripts/phase0_discover_features.py --config-name=phase0 gene=BRCA1 remote=true
+"""
+
+from __future__ import annotations
 
 import hydra
-import numpy as np
-import wandb
-from omegaconf import DictConfig
-from tqdm import tqdm
-
-from causal_steering.data.clinvar import load_clinvar
-from causal_steering.models.evo2 import Evo2WithHook
-from causal_steering.models.probe import PathogenicityProbe
-from causal_steering.models.sae import BatchTopKSAE
-from causal_steering.steering.guard import DistributionGuard
-from causal_steering.utils.logging import init_wandb
-from causal_steering.utils.seeding import seed_everything
+from omegaconf import DictConfig, OmegaConf
 
 
 @hydra.main(config_path="../configs", config_name="phase0", version_base=None)
 def main(cfg: DictConfig) -> None:
-    seed_everything(cfg.seed)
-    init_wandb(cfg, job_type="phase0")
+    if cfg.get("remote", False):
+        from causal_steering.utils.modal_app import app, phase0
 
-    df = load_clinvar(cfg.data.clinvar_path, cfg.gene)
-    sequences = df["sequence"].tolist()
-    labels = df["label"].values
-    wandb.log({"n_variants": len(df), "n_pathogenic": int(labels.sum())})
-    print(f"Loaded {len(df)} {cfg.gene} variants ({int(labels.sum())} pathogenic)")
+        with app.run():
+            result = phase0.remote(gene=cfg.gene)
+    else:
+        from causal_steering.phase0 import run_phase0
 
-    evo2 = Evo2WithHook(cfg.evo2.model_id, device=cfg.evo2.device, layer=cfg.layer)
-    sae = BatchTopKSAE(cfg.sae.model_id, device=cfg.evo2.device)
+        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+        assert isinstance(cfg_dict, dict)
+        result = run_phase0(cfg_dict)
 
-    all_features = []
-    for seq in tqdm(sequences, desc="Encoding variants"):
-        hidden = evo2.get_activations([seq])          # [1, seq_len, hidden]
-        features = sae.encode(hidden.mean(dim=1))     # [1, n_features]
-        all_features.append(features.cpu().float().numpy()[0])
-
-    X = np.array(all_features)  # [n_variants, n_features]
-
-    guard = DistributionGuard(
-        q_low=cfg.steering.guard_quantile_low,
-        q_high=cfg.steering.guard_quantile_high,
-    )
-    guard.fit(X)
-
-    probe = PathogenicityProbe(C=cfg.probe.C, max_iter=cfg.probe.max_iter)
-    metrics = probe.fit(X, labels, cv_folds=cfg.probe.cv_folds)
-    wandb.log(metrics)
-    print(f"Probe CV AUC: {metrics['cv_auc_mean']:.3f} ± {metrics['cv_auc_std']:.3f}")
-
-    if metrics["cv_auc_mean"] < 0.85:
-        print("WARNING: AUC < 0.85 — see risk log in ROADMAP.md")
-
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    probe.save_mask(out_dir / "feature_mask.json", k=cfg.probe.feature_mask_size)
-    guard.save(out_dir / "guard.npz")
-
-    print(f"Outputs written to {out_dir}")
-    wandb.finish()
+    print(result)
 
 
 if __name__ == "__main__":
