@@ -3,3 +3,6 @@ defaults:
   - _self_
 
 output_dir: runs/phase0/${gene}
+# When true, scripts/phase0_discover_features.py dispatches to Modal
+# (utils.modal_app::phase0, gene-only). False = run locally (assumes a local GPU).
+remote: false

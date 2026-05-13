@@ -3,7 +3,11 @@ seed: 42
 layer: 26
 
 evo2:
-  model_id: arcinstitute/evo2_7b
+  # Must be evo2_7b_262k, not evo2_7b — the Goodfire SAE is architecturally
+  # tied to the 262k variant (MLP intermediate 11264 vs 11008). See
+  # docs/goodfire_query.md for the model-variant audit.
+  model_name: evo2_7b_262k
+  local_path: null
   device: cuda
   max_new_tokens: 512
 
@@ -35,7 +39,15 @@ reward:
   cadd_weight: 0.5
 
 data:
-  clinvar_path: data/clinvar_${gene}.tsv
+  # ClinVar: laptop default. On Modal this is overridden in
+  # utils.modal_app::phase0 to /weights/clinvar/variant_summary.txt.gz
+  # after cache_clinvar() has populated the Volume.
+  clinvar_path: data/clinvar/variant_summary.txt.gz
+  # GRCh38 reference directory holding per-chromosome chr<N>.fa files. Modal
+  # phase0 overrides this to /weights/reference/grch38 after cache_reference.
+  reference_path: data/reference/grch38
+  # ±N bp window around each variant; output sequence length = 2N+1.
+  sequence_window: 512
   mave_path: data/mave_${gene}.csv
   alphamissense_path: data/alphamissense_scores.parquet
   cadd_path: data/cadd_scores.tsv.gz
