@@ -6,9 +6,10 @@ dist/
 venv/
 .env
 
-# Data and run outputs — use Modal Volume
-data/
-runs/
+# Raw data + run outputs at the project root (use Modal Volume for these).
+# Anchored to root so it does not match src/causal_steering/data/ (Python pkg).
+/data/
+/runs/
 *.parquet
 *.tsv.gz
 
