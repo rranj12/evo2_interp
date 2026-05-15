@@ -524,6 +524,228 @@ def inspect_evo2_generate_api() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Week 3, step 2: hand-specified steering vector end-to-end (GPU-only)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 45,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def test_week3_hand_steer(
+    gene: str = "BRCA1",
+    max_new_tokens: int = 16,
+) -> dict:
+    """
+    Exercise the full encode → multiplicative-steer → guard → decode → inject
+    → generate path with three hand-specified steering vectors, against the
+    Phase 0 BRCA1 mask + guard. No GP, no reward — composition check only.
+
+      modal run -m causal_steering.utils.modal_app::test_week3_hand_steer
+
+    Logs to W&B (one row per vector) and asserts that an identity steer
+    (scale=1.0 everywhere on the mask) yields byte-identical generation to
+    `patch_fn=None` under greedy decoding — the composition-level
+    non-destructive guarantee.
+    """
+    import hashlib
+
+    import torch
+    import wandb
+    from hydra import compose, initialize_config_dir
+
+    from causal_steering.eval.fast_reward import SeedAnchor, compute_fast_reward
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+    from causal_steering.steering.guard import DistributionGuard
+    from causal_steering.steering.patch import make_patch_fn
+
+    cache_weights.local(force=False)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    guard_path = phase0_dir / "guard.npz"
+    assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    assert guard_path.exists(), f"missing {guard_path} — run phase0 first"
+
+    feature_ids = PathogenicityProbe.load_mask(mask_path)
+    guard = DistributionGuard.load(guard_path)
+    print(f"[hand_steer] mask={len(feature_ids)} ids, guard q=[{guard.q_low},{guard.q_high}]")
+
+    evo2 = Evo2WithHook(
+        model_name="evo2_7b_262k",
+        local_path=None,
+        device="cuda",
+        block_index=26,
+    )
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device="cuda")
+
+    # Reuse the BRCA1 NM_007294.4 mRNA prefix from smoke_test as the seed.
+    seed_seq = (
+        "GCTGAGACTTCCTGGACGGGGGACAGGCTGTGGGGTTTCTCAGATAACTGGGCCCCTGCGCTCAGGAGG"
+        "CCTTCACCCTCTGCTCTGGGTAAAGTTCATTGGAACAGAAAGAAATGGATTTATCTGCTCTTCGCGTT"
+        "GAAGAAGTACAAAATGTCATTAATGCTATGCAGAAAATCTTAGAGTGTCCCATCTGTCTGGAGTTGAT"
+    )
+    seed_hash = hashlib.sha256(seed_seq.encode()).hexdigest()[:12]
+
+    # BRCA1 NM_007294.4 is transcribed off chr17's minus strand, so seed_seq
+    # (mRNA sense direction) walks DOWN forward-strand chr17 from its 5' end.
+    # Approximate genomic anchor for seed_seq[0] on GRCh38; AM/CADD aren't
+    # yet cached on /weights, so reward lookups currently return None and
+    # `reward/value` will be 0.0 with `n_variants > 0` — this exercises the
+    # full plumbing without claiming a calibrated reward yet.
+    seed_anchor = SeedAnchor(chrom="chr17", start=43_125_370, strand="-")
+
+    # Compose the steering Hydra config so compute_fast_reward sees the
+    # reward weights + (currently uncached) AM/CADD paths.
+    with initialize_config_dir(config_dir="/configs", version_base=None):
+        reward_cfg = compose(config_name="steering", overrides=[f"gene={gene}"])
+
+    run = wandb.init(
+        project="causal-steering",
+        job_type="hand_steer",
+        tags=[gene, "week3", "hand_steer"],
+        config={
+            "gene": gene,
+            "stage": "week3_hand_steer",
+            "mask_size": len(feature_ids),
+            "guard_q_low": guard.q_low,
+            "guard_q_high": guard.q_high,
+            "max_new_tokens": max_new_tokens,
+            "decoding": "greedy",
+            "seed_seq_hash": seed_hash,
+        },
+        reinit=True,
+    )
+
+    # ---- L0-on-mask diagnostic (prefill activations) --------------------------
+    # How many of our ~100 mask features are actually active per token after
+    # BatchTopK? If this is tiny (≪1 per token), scaling will have almost no
+    # effect because 0 × any_scale = 0. Measured once on the seed; prefill
+    # dominates generation since T_prompt >> max_new_tokens.
+    seed_hidden = evo2.get_activations([seed_seq])              # [1, T, hidden]
+    seed_features = sae.encode(seed_hidden)                      # [1, T, n_features]
+    mask_features = seed_features[..., feature_ids]              # [1, T, |mask|]
+    active = (mask_features != 0).float()
+    mask_l0_mean = float(active.sum(dim=-1).mean().item())       # avg # active mask feats / token
+    mask_l0_total = int(active.sum().item())                     # total firings across mask × tokens
+    mask_active_frac = float((active.sum(dim=(0, 1)) > 0).float().mean().item())
+    total_l0_per_token = float((seed_features != 0).float().sum(dim=-1).mean().item())
+    diag = {
+        "diag/mask_l0_mean": mask_l0_mean,        # avg active mask feats per token
+        "diag/mask_l0_total": mask_l0_total,      # total mask firings across all tokens
+        "diag/mask_active_frac": mask_active_frac,  # frac of mask with ≥1 firing
+        "diag/total_l0_per_token": total_l0_per_token,  # for context (BatchTopK target)
+        "diag/n_tokens": int(seed_features.shape[1]),
+    }
+    wandb.log(diag)
+    print(
+        f"[hand_steer] mask_l0_mean={mask_l0_mean:.3f}  "
+        f"mask_active_frac={mask_active_frac:.3f}  "
+        f"total_l0_per_token={total_l0_per_token:.1f}  "
+        f"(prefill T={seed_features.shape[1]})"
+    )
+
+    # Unsteered reference under greedy for the byte-identical assertion below.
+    none_gen = evo2.generate_with_patch(
+        seed_sequences=[seed_seq],
+        patch_fn=None,
+        max_new_tokens=max_new_tokens,
+        temperature=0,
+    )[0]
+
+    vectors = [
+        ("identity_1x", torch.ones(len(feature_ids))),
+        ("upscale_2x", torch.ones(len(feature_ids)) * 2.0),
+        ("aggressive_5x", torch.ones(len(feature_ids)) * 5.0),
+    ]
+
+    results: list[dict] = []
+    for label, vec in vectors:
+        patch_fn, clip_rates = make_patch_fn(
+            sae_encode=sae.encode,
+            sae_decode=sae.decode,
+            steering_vector=vec,
+            feature_ids=feature_ids,
+            guard_clip=guard.clip,
+        )
+        gen = evo2.generate_with_patch(
+            seed_sequences=[seed_seq],
+            patch_fn=patch_fn,
+            max_new_tokens=max_new_tokens,
+            temperature=0,
+        )[0]
+        rates = clip_rates or [0.0]
+        mean_rate = float(sum(rates) / len(rates))
+        max_rate = float(max(rates))
+
+        reward = compute_fast_reward(
+            reward_cfg, seed_seq, gen, none_gen, seed_anchor
+        )
+
+        row = {
+            "steer/vec_label": label,
+            "steer/clip_rate_mean": mean_rate,
+            "steer/clip_rate_max": max_rate,
+            "steer/generated_seq": gen,
+            "steer/seed_seq_hash": seed_hash,
+            "reward/value": reward["reward"],
+            "reward/n_variants": reward["n_variants"],
+            "reward/am_mean": reward["am_mean"],
+            "reward/cadd_mean": reward["cadd_mean"],
+            "reward/n_am_missing": reward["n_am_missing"],
+            "reward/n_cadd_missing": reward["n_cadd_missing"],
+        }
+        wandb.log(row)
+        print(
+            f"[hand_steer] {label}: clip_rate mean={mean_rate:.4f} max={max_rate:.4f} "
+            f"reward={reward['reward']:.4f} n_variants={reward['n_variants']} "
+            f"am_mean={reward['am_mean']} cadd_mean={reward['cadd_mean']} "
+            f"gen={gen!r}"
+        )
+        results.append({
+            "label": label,
+            "gen": gen,
+            "clip_rate_mean": mean_rate,
+            "clip_rate_max": max_rate,
+            "reward": reward,
+        })
+
+    run.finish()
+
+    # Composition-level non-destructive guarantee: identity steer must match
+    # the no-patch path byte-for-byte under greedy decoding. (Note: with
+    # q=[q_low,q_high] guard quantiles fit on Phase 0 data, identity's
+    # clip_rate is typically small-but-nonzero on a held-out seed, since by
+    # construction the band excludes the tails. Empirically those small
+    # perturbations don't flip greedy argmax on in-distribution input.)
+    identity = next(r for r in results if r["label"] == "identity_1x")
+    assert identity["gen"] == none_gen, (
+        f"identity steer changed greedy output (clip_rate_max="
+        f"{identity['clip_rate_max']:.4f}):\n"
+        f"  none    : {none_gen!r}\n"
+        f"  identity: {identity['gen']!r}"
+    )
+
+    rates_in_order = [r["clip_rate_mean"] for r in results]
+    monotone = all(a <= b + 1e-9 for a, b in zip(rates_in_order, rates_in_order[1:]))
+    return {
+        "passed": True,
+        "results": results,
+        "clip_rates_monotone": monotone,
+        "none_gen": none_gen,
+        "diag": diag,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Week 3, step 1: tests for Evo2WithHook.generate_with_patch (GPU-only)
 # ---------------------------------------------------------------------------
 
