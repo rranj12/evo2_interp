@@ -20,6 +20,8 @@ on the same module, using `interventions` semantics analogous to
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 
@@ -72,3 +74,64 @@ class Evo2WithHook:
 
         assert self._cached is not None, "hook did not fire"
         return self._cached
+
+    @torch.no_grad()
+    def generate_with_patch(
+        self,
+        seed_sequences: list[str],
+        patch_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        top_k: int | None = 4,
+    ) -> list[str]:
+        """
+        Generate continuations of `seed_sequences` with an optional residual-
+        stream patch applied via a forward hook on `self.block`.
+
+        The hook replaces the block's output activations with
+        `patch_fn(activations)` on every forward pass — prefill *and* each
+        decoded token — so KV-cached generation composes naturally. If
+        `patch_fn is None`, no hook is attached and behaviour is identical to
+        the unmodified `evo.generate(...)` call.
+
+        `temperature == 0` is interpreted as greedy decoding (top_k=1).
+        `top_k is None` disables top-k filtering by passing the full vocab.
+        """
+        # Map the public spec onto evo.generate's argument space.
+        if temperature == 0:
+            eff_temperature = 1.0
+            eff_top_k = 1
+        else:
+            eff_temperature = temperature
+            eff_top_k = top_k if top_k is not None else self.tokenizer.vocab_size
+
+        def _write_hook(module, inputs, output):
+            is_tuple = isinstance(output, tuple)
+            acts = output[0] if is_tuple else output
+            assert patch_fn is not None  # disabled-hook branch never registers
+            new = patch_fn(acts)
+            if is_tuple:
+                return (new, *output[1:])
+            return new
+
+        handle = None
+        if patch_fn is not None:
+            handle = self.block.register_forward_hook(_write_hook)
+        try:
+            # vortex.model.generation.GenerationOutput: .sequences, .logits,
+            # .logprobs_mean — despite the Tuple[List[str], List[float]] hint
+            # on Evo2.generate, the runtime hands back an attribute object.
+            result = self.evo.generate(
+                prompt_seqs=seed_sequences,
+                n_tokens=max_new_tokens,
+                temperature=eff_temperature,
+                top_k=eff_top_k,
+                top_p=1.0,
+                batched=True,
+                cached_generation=True,
+                verbose=0,
+            )
+        finally:
+            if handle is not None:
+                handle.remove()
+        return list(result.sequences)

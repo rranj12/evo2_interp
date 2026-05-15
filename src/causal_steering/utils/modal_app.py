@@ -65,6 +65,10 @@ gpu_image = (
     .pip_install("evo2")
     # Project's other deps (botorch, hydra, wandb, etc.); torch>=2.3 already satisfied.
     .pip_install_from_pyproject("pyproject.toml")
+    # pytest lives under [project.optional-dependencies].dev — pulled in
+    # explicitly so GPU-only entrypoints (e.g. test_week3_generation) can run
+    # the test suite via pytest.main without needing the full dev extra.
+    .pip_install("pytest>=8.0")
     .env({"HF_HOME": "/weights/.hf_cache"})
     # Ship Hydra configs into the container so functions can compose() inside.
     # MUST be the last image step: Modal forbids further build steps after a
@@ -73,6 +77,12 @@ gpu_image = (
     .add_local_dir(
         str(Path(__file__).resolve().parents[3] / "configs"),
         "/configs",
+    )
+    # Ship tests/ so GPU-only test entrypoints (e.g. test_week3_generation)
+    # can dispatch them via `pytest.main`. Lazy mount; kept after configs.
+    .add_local_dir(
+        str(Path(__file__).resolve().parents[3] / "tests"),
+        "/tests",
     )
 )
 
@@ -415,6 +425,137 @@ def inspect_evo2_modules() -> dict:
         "layer26_keys": layer26,
         "layer26_paths": layer26_paths,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: discover Evo 2's generation API (Week 3, step 1)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 15,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def inspect_evo2_generate_api() -> dict:
+    """
+    Report whether the installed `evo2.Evo2` object exposes a `.generate()`
+    method (and signature) so we can decide between the built-in path and a
+    hand-rolled AR loop for `generate_with_patch`. Read-only.
+    """
+    import inspect
+
+    from evo2 import Evo2
+
+    cache_weights.local(force=False)
+
+    evo = Evo2("evo2_7b_262k", local_path=None)
+    out: dict = {}
+
+    def _surface(obj, name: str) -> dict:
+        members = [m for m in dir(obj) if not m.startswith("_")]
+        info: dict = {
+            "type": type(obj).__name__,
+            "module": type(obj).__module__,
+            "public_attrs": members,
+            "has_generate": hasattr(obj, "generate"),
+        }
+        gen = getattr(obj, "generate", None)
+        if callable(gen):
+            try:
+                info["generate_signature"] = str(inspect.signature(gen))
+            except (ValueError, TypeError) as e:
+                info["generate_signature_error"] = repr(e)
+            try:
+                info["generate_doc"] = (gen.__doc__ or "")[:600]
+            except Exception:
+                pass
+            try:
+                info["generate_source_file"] = inspect.getsourcefile(gen)
+            except Exception:
+                pass
+        return info
+
+    out["evo"] = _surface(evo, "evo")
+    out["inner"] = _surface(evo.model, "inner")
+    out["tokenizer"] = _surface(evo.tokenizer, "tokenizer")
+
+    # Probe the actual return type of generate(): the type hint claims a
+    # tuple but the runtime hands back a GenerationOutput object.
+    try:
+        result = evo.generate(
+            prompt_seqs=["ACGT"],
+            n_tokens=2,
+            temperature=1.0,
+            top_k=1,
+            cached_generation=True,
+            verbose=0,
+        )
+        out["generate_return"] = {
+            "type": type(result).__name__,
+            "module": type(result).__module__,
+            "is_tuple": isinstance(result, tuple),
+            "public_attrs": [a for a in dir(result) if not a.startswith("_")],
+        }
+        for attr in ("sequences", "scores", "logits", "tokens"):
+            if hasattr(result, attr):
+                v = getattr(result, attr)
+                out["generate_return"][f"{attr}_type"] = type(v).__name__
+                out["generate_return"][f"{attr}_repr"] = repr(v)[:200]
+    except Exception as e:
+        out["generate_return_error"] = repr(e)
+
+    # Tokenizer round-trip — needed to choose decoding back to nt strings.
+    try:
+        toks = evo.tokenizer.tokenize("ACGT")
+        out["tokenizer_tokenize_ACGT"] = list(toks)
+        # Probe common detokenize names
+        for name in ("detokenize", "decode", "untokenize", "ids_to_tokens"):
+            if hasattr(evo.tokenizer, name):
+                out.setdefault("tokenizer_inverse_methods", []).append(name)
+    except Exception as e:
+        out["tokenizer_probe_error"] = repr(e)
+
+    import json
+    print(json.dumps(out, indent=2, default=str))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Week 3, step 1: tests for Evo2WithHook.generate_with_patch (GPU-only)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 30,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def test_week3_generation() -> dict:
+    """
+    Run the GPU-only suite in tests/test_evo2_generation.py via `pytest.main`.
+
+    The four assertions are:
+      1. patch_fn=None produces valid nucleotide strings of expected length.
+      2. patch_fn=None and patch_fn=lambda h: h are byte-identical under
+         greedy decoding (non-destructive guarantee).
+      3. A small additive-noise patch_fn changes the output (hook fires).
+      4. A raising patch_fn propagates the exception AND leaves no zombie
+         hook (subsequent get_activations() still works).
+    """
+    import pytest
+
+    cache_weights.local(force=False)
+
+    rc = pytest.main(["-xvs", "/tests/test_evo2_generation.py"])
+    out = {"pytest_exit_code": int(rc), "passed": int(rc) == 0}
+    if not out["passed"]:
+        raise AssertionError(f"test_week3_generation: pytest exit code {rc}")
+    return out
 
 
 # ---------------------------------------------------------------------------
