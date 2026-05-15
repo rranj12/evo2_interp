@@ -746,6 +746,278 @@ def test_week3_hand_steer(
 
 
 # ---------------------------------------------------------------------------
+# Week 3, step 2 follow-up: mask-L0 at variant positions only (GPU-only)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 30,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def diag_variant_position_l0(
+    gene: str = "BRCA1",
+    n_variants: int = 8,
+    sequence_window: int = 512,
+) -> dict:
+    """
+    Disambiguate the "mask is sparse" finding from Week 3 step 2: does the
+    BRCA1 Phase 0 mask fire at the variant position specifically? Phase 0
+    trained the probe on per-variant-position SAE features, so the relevant
+    sparsity is L0 *at that position*, not averaged over arbitrary prefill
+    tokens. We expect ~5–15 mask features active per variant if the mask is
+    doing real work; ~0.1 would be a serious problem.
+    """
+    import numpy as np
+    import torch
+    import wandb
+
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import add_sequence_column
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    feature_ids = PathogenicityProbe.load_mask(mask_path)
+
+    df = load_clinvar(CLINVAR_PATH, gene=gene)
+    df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=sequence_window)
+    assert len(df) > 0, "all variants dropped during sequence extraction"
+    # Sample deterministically from the surviving Phase 0 set.
+    rng = np.random.default_rng(0)
+    take = min(n_variants, len(df))
+    idx = rng.choice(len(df), size=take, replace=False)
+    df = df.iloc[idx].reset_index(drop=True)
+
+    evo2 = Evo2WithHook(model_name="evo2_7b_262k", local_path=None, device="cuda", block_index=26)
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device="cuda")
+    variant_idx = sequence_window  # same convention as phase0.discover
+
+    run = wandb.init(
+        project="causal-steering",
+        job_type="diag_variant_position_l0",
+        tags=[gene, "week3", "variant_position_l0"],
+        config={
+            "gene": gene,
+            "stage": "week3_variant_position_l0",
+            "mask_size": len(feature_ids),
+            "n_variants": int(take),
+            "sequence_window": sequence_window,
+            "variant_idx": variant_idx,
+        },
+        reinit=True,
+    )
+
+    per_variant: list[dict] = []
+    l0s: list[int] = []
+    for i, row in df.iterrows():
+        seq = row["sequence"]
+        hidden = evo2.get_activations([seq])                  # [1, T, hidden]
+        feats = sae.encode(hidden)[0, variant_idx, :]          # [n_features]
+        mask_feats = feats[feature_ids]
+        l0 = int((mask_feats != 0).sum().item())
+        total_l0_at_pos = int((feats != 0).sum().item())
+        l0s.append(l0)
+        v = {
+            "variant/chrom": str(row["chrom"]),
+            "variant/pos": int(row["pos"]),
+            "variant/label": int(row["label"]),
+            "variant/mask_l0_at_variant": l0,
+            "variant/total_l0_at_variant": total_l0_at_pos,
+        }
+        wandb.log(v)
+        per_variant.append(v)
+        print(
+            f"[diag] {row['chrom']}:{row['pos']} label={row['label']} "
+            f"mask_l0_at_variant={l0}  total_l0_at_pos={total_l0_at_pos}"
+        )
+
+    summary = {
+        "diag/mask_l0_at_variant_mean": float(np.mean(l0s)),
+        "diag/mask_l0_at_variant_min": int(np.min(l0s)),
+        "diag/mask_l0_at_variant_max": int(np.max(l0s)),
+        "diag/mask_l0_at_variant_median": float(np.median(l0s)),
+    }
+    wandb.log(summary)
+    print(f"[diag] summary: {summary}")
+    run.finish()
+
+    return {"summary": summary, "per_variant": per_variant}
+
+
+# ---------------------------------------------------------------------------
+# Week 3, step 2 follow-up #2: mask-size scaling of variant-position L0
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 90,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def diag_mask_size_scaling(
+    gene: str = "BRCA1",
+    n_variants: int = 8,
+    sequence_window: int = 512,
+) -> dict:
+    mask_sizes: tuple[int, ...] = (50, 100, 250, 500, 1000, 2000)
+    """
+    Does mask_l0 at the variant position scale with mask size, or plateau?
+    Plateau ⇒ the probe's high-|coef| features are systematically the sparse
+    ones (bad — widening the mask won't help). Linear ⇒ widening is a real
+    lever for steering force.
+
+    Refits the Phase 0 logistic probe inline so we have the full per-feature
+    |coef| ranking (the saved `feature_mask.json` only stores the top-100).
+    Cross-checks that the refit top-100 matches the saved mask exactly.
+    Samples the same 8 variants as `diag_variant_position_l0` (np.random.default_rng(0)).
+    """
+    import numpy as np
+    import wandb
+
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import add_sequence_column
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+    from causal_steering.utils.seeding import seed_everything
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    saved_mask = PathogenicityProbe.load_mask(mask_path)
+
+    # ---- Replicate Phase 0 data path ------------------------------------------
+    df = load_clinvar(CLINVAR_PATH, gene=gene)
+    df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=sequence_window)
+    assert len(df) > 0, "all variants dropped during sequence extraction"
+    labels = df["label"].to_numpy()
+    sequences = df["sequence"].tolist()
+    variant_idx = sequence_window
+    print(f"[scaling] {len(df)} {gene} variants survived sequence extraction")
+
+    # Match Phase 0's RNG (seed_everything in run_phase0) so probe coefficients
+    # — and therefore the |coef| ranking — line up with the saved mask.
+    seed_everything(0)
+
+    evo2 = Evo2WithHook(
+        model_name="evo2_7b_262k", local_path=None, device="cuda", block_index=26
+    )
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device="cuda")
+
+    # Encode every variant at its variant position — same recipe as Phase 0.
+    feats: list[np.ndarray] = []
+    for seq in sequences:
+        hidden = evo2.get_activations([seq])                          # [1, T, H]
+        f = sae.encode(hidden)[0, variant_idx, :]                      # [n_features]
+        feats.append(f.cpu().float().numpy())
+    X = np.stack(feats, axis=0)                                        # [N, n_features]
+    print(f"[scaling] encoded X shape={X.shape}; nonzero frac={(X != 0).mean():.4f}")
+
+    # ---- Refit probe to recover full |coef| ranking ---------------------------
+    probe = PathogenicityProbe()
+    cv = probe.fit(X, labels, cv_folds=5)
+    assert probe._clf is not None
+    coefs = np.abs(probe._clf.coef_[0])
+    ranking = np.argsort(coefs)[::-1]
+    print(f"[scaling] refit AUC={cv['cv_auc_mean']:.3f} ± {cv['cv_auc_std']:.3f}")
+
+    # Sanity: the refit top-100 should equal the saved mask. If not, surface it.
+    refit_top100 = ranking[:100].tolist()
+    top100_match = set(refit_top100) == set(saved_mask)
+    print(f"[scaling] refit_top100 ≡ saved_mask: {top100_match}")
+
+    # ---- Same 8 variants as diag_variant_position_l0 --------------------------
+    rng = np.random.default_rng(0)
+    take = min(n_variants, len(df))
+    idx = rng.choice(len(df), size=take, replace=False)
+    X_sample = X[idx]                                                  # [8, n_features]
+
+    # ---- Mask-size sweep ------------------------------------------------------
+    run = wandb.init(
+        project="causal-steering",
+        job_type="diag_mask_size_scaling",
+        tags=[gene, "week3", "mask_size_scaling"],
+        config={
+            "gene": gene,
+            "stage": "week3_mask_size_scaling",
+            "n_variants": int(take),
+            "n_total_variants_phase0": int(len(df)),
+            "sequence_window": sequence_window,
+            "mask_sizes": list(mask_sizes),
+            "refit_auc_mean": cv["cv_auc_mean"],
+            "refit_auc_std": cv["cv_auc_std"],
+            "refit_top100_matches_saved": top100_match,
+        },
+        reinit=True,
+    )
+
+    rows: list[dict] = []
+    for k in mask_sizes:
+        mask_ids = ranking[:k]
+        active_at_mask = (X_sample[:, mask_ids] != 0)                  # [8, k]
+        l0_per_variant = active_at_mask.sum(axis=1)                    # [8]
+        row = {
+            "scaling/mask_size": int(k),
+            "scaling/mask_l0_mean": float(l0_per_variant.mean()),
+            "scaling/mask_l0_median": float(np.median(l0_per_variant)),
+            "scaling/mask_l0_min": int(l0_per_variant.min()),
+            "scaling/mask_l0_max": int(l0_per_variant.max()),
+            "scaling/mask_l0_fraction": float(l0_per_variant.mean() / k),
+        }
+        wandb.log(row)
+        rows.append(row)
+        print(
+            f"[scaling] k={k:>4d}  l0_mean={row['scaling/mask_l0_mean']:.2f}  "
+            f"median={row['scaling/mask_l0_median']:.1f}  "
+            f"range=[{row['scaling/mask_l0_min']},{row['scaling/mask_l0_max']}]  "
+            f"frac={row['scaling/mask_l0_fraction']:.4f}"
+        )
+
+    # As a control, sample 1000 random features and measure the same thing.
+    rng_ctrl = np.random.default_rng(123)
+    random_mask = rng_ctrl.choice(X.shape[1], size=1000, replace=False)
+    rand_l0 = (X_sample[:, random_mask] != 0).sum(axis=1)
+    control = {
+        "scaling/random_mask_size": 1000,
+        "scaling/random_l0_mean": float(rand_l0.mean()),
+        "scaling/random_l0_fraction": float(rand_l0.mean() / 1000),
+    }
+    wandb.log(control)
+    print(f"[scaling] CONTROL random k=1000  l0_mean={control['scaling/random_l0_mean']:.2f}  "
+          f"frac={control['scaling/random_l0_fraction']:.4f}")
+
+    run.finish()
+    return {
+        "refit_top100_matches_saved": top100_match,
+        "rows": rows,
+        "control_random_k1000": control,
+        "refit_auc_mean": cv["cv_auc_mean"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Week 3, step 1: tests for Evo2WithHook.generate_with_patch (GPU-only)
 # ---------------------------------------------------------------------------
 
