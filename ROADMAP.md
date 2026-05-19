@@ -1,6 +1,6 @@
 # ROADMAP.md
 
-## What we're building
+## What I am building
 
 A **general method** for learning causal steering policies over SAE features in genomic foundation models. The method should work on any gene with sufficient ClinVar coverage; the contribution is the *technique*, not a BRCA1-specific result.
 
