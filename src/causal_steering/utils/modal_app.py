@@ -1053,6 +1053,46 @@ def test_week3_generation() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Week 4 gate: SAE identity round-trip must not shift probe predictions
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 60,  # encodes the full Phase-0 BRCA1 set once; budget headroom
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def test_identity_roundtrip(gene: str = "BRCA1") -> dict:
+    """
+    Run tests/test_identity_roundtrip.py via `pytest.main`.
+
+    This is the **Week 4 prerequisite gate** — the BayesOpt arm and (later)
+    the PPO arm must not start until this passes. The test checks that the
+    SAE encode → decode round-trip, with no steering applied, leaves probe
+    pathogenicity predictions within tolerance of the no-SAE baseline. If
+    recon error alone moves the probe meaningfully, any causal claim from
+    steering on top of it is confounded.
+
+    Preconditions on the Volume: Evo 2 weights, Goodfire SAE, ClinVar
+    variant_summary.txt.gz, and the GRCh38 chromosome(s) that `gene`'s
+    variants touch. All cached idempotently below before pytest fires.
+    """
+    import pytest
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    rc = pytest.main(["-xvs", "/tests/test_identity_roundtrip.py"])
+    out = {"pytest_exit_code": int(rc), "passed": int(rc) == 0, "gene": gene}
+    if not out["passed"]:
+        raise AssertionError(f"test_identity_roundtrip: pytest exit code {rc}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Diagnostic: compare manual forward_hook vs vortex `return_embeddings`
 # ---------------------------------------------------------------------------
 

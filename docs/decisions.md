@@ -2,6 +2,34 @@
 
 One-paragraph notes on locked decisions. Newest first.
 
+## 2026-05-19 — Run both BayesOpt (GP+EI) and RL (PPO); stop calling GP+EI "RL"
+
+Proposal feedback flagged that the project was framed as "an RL loop" while
+the actual implementation is Bayesian optimization (BoTorch SingleTaskGP with
+Matérn 5/2 kernel + analytic Expected Improvement). That is a real
+mischaracterization — GP+EI is not RL — and was carried through `CLAUDE.md`,
+the prior `ROADMAP.md`, and the original "Locked decisions" entry that read
+"GP+EI over PPO/REINFORCE." Resolution: keep the existing GP+EI implementation
+*as* the BayesOpt arm (it works, it's sample-efficient, and per-variant
+search is the right baseline given Evo 2 generation cost), and add a second
+arm — PPO — that does what an RL formulation actually justifies: a policy
+network conditioned on sequence context, whose weights carry across variants
+and whose contribution would be *generalization* of a learned steering policy
+rather than per-variant optimization. Both arms share Phase 0 mask,
+distribution guard, SAE decoder patch, generation, and AM+CADD fast reward;
+the only thing that differs is what proposes the steering vector and what
+state it maintains. The Week 4 BayesOpt run becomes a go/no-go gate for the
+fast signal itself; Week 5 stands up PPO; Week 6 runs both arms on TP53 and
+adds the zero-shot PPO-policy-transfer-to-TP53 test that is the strongest
+form of the generalization claim. Code-level impact: `steering/loop.py`
+becomes policy-agnostic (`(config, mask, policy) → (trajectory, atlas)`); a
+`policy_ppo.py` lands Week 5; per-run artifacts now sit under
+`runs/steering/<gene>/<method>/<seed>/`; the steering config carries an
+explicit `method: bayesopt | ppo` field so docs, W&B, and atlases never have
+to guess which arm produced a result. **Documentation rule:** the BayesOpt
+arm is labelled `bayesopt` or `gp_ei`, never "RL." "RL" refers only to the
+PPO arm.
+
 ## 2026-05-13 — Open question (Week 4): mask-feature sparsity under BatchTopK
 
 The Week 3 hand-steer entrypoint (W&B run `dulcet-sunset-18`) shows that on

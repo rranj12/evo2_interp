@@ -2,5 +2,8 @@ defaults:
   - base
   - _self_
 
-atlas_path: runs/steering/${gene}/seed_0/atlas.json
-output_dir: runs/eval/${gene}
+# Which steering arm's atlas to evaluate. Override on the CLI:
+#   python scripts/eval_atlas.py method=ppo gene=BRCA1
+method: bayesopt
+atlas_path: runs/steering/${gene}/${method}/seed_0/atlas.json
+output_dir: runs/eval/${gene}/${method}
