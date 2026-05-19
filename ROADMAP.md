@@ -1,7 +1,5 @@
 # ROADMAP.md
 
-8-week plan. CS 153 final project, Spring '26. Solo.
-
 ## What we're building
 
 A **general method** for learning causal steering policies over SAE features in genomic foundation models. The method should work on any gene with sufficient ClinVar coverage; the contribution is the *technique*, not a BRCA1-specific result.
