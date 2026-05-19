@@ -23,3 +23,5 @@ venv/
 
 # W&B
 wandb/
+
+CLAUDE.md
