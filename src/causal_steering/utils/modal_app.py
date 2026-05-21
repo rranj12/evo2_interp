@@ -1068,16 +1068,28 @@ def test_identity_roundtrip(gene: str = "BRCA1") -> dict:
     """
     Run tests/test_identity_roundtrip.py via `pytest.main`.
 
-    This is the **Week 4 prerequisite gate** — the BayesOpt arm and (later)
-    the PPO arm must not start until this passes. The test checks that the
-    SAE encode → decode round-trip, with no steering applied, leaves probe
-    pathogenicity predictions within tolerance of the no-SAE baseline. If
-    recon error alone moves the probe meaningfully, any causal claim from
-    steering on top of it is confounded.
+    **Week 4 prerequisite gate.** Checks three properties of the production
+    delta-form steering patch (`steering/patch.py::make_patch_fn`):
+
+      1. Identity at scale=1.0 is byte-identical to no-patch generation.
+      2. At scale=2.0, the Phase-0 mask produces a meaningfully larger
+         output shift than the same number of random non-mask features
+         (specificity — the load-bearing property; if absent, BO is
+         fitting noise).
+      3. All patched generations stay in valid ACGT space (coherence).
+
+    The earlier substitute-form gate (`h ← decode(encode(h))`) was retired
+    on 2026-05-19 because it tested a strictly stronger property than
+    steering relies on, and failed catastrophically due to recon × BatchTopK
+    interaction. That diagnostic is preserved at
+    `tests/diagnostics/test_substitute_roundtrip.py` — dispatch via
+    `diag_substitute_roundtrip`. See `docs/decisions.md` 2026-05-19 for the
+    full reasoning.
 
     Preconditions on the Volume: Evo 2 weights, Goodfire SAE, ClinVar
-    variant_summary.txt.gz, and the GRCh38 chromosome(s) that `gene`'s
-    variants touch. All cached idempotently below before pytest fires.
+    variant_summary.txt.gz, GRCh38 chromosomes, and a Phase-0 run for
+    `gene` (provides feature_mask.json + guard.npz). All cached
+    idempotently below before pytest fires.
     """
     import pytest
 
@@ -1089,6 +1101,241 @@ def test_identity_roundtrip(gene: str = "BRCA1") -> dict:
     out = {"pytest_exit_code": int(rc), "passed": int(rc) == 0, "gene": gene}
     if not out["passed"]:
         raise AssertionError(f"test_identity_roundtrip: pytest exit code {rc}")
+    return out
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def diag_substitute_roundtrip(gene: str = "BRCA1") -> dict:
+    """
+    Run tests/diagnostics/test_substitute_roundtrip.py via `pytest.main`.
+
+    Diagnostic only — NOT the Week 4 gate. Tests the strictly stronger
+    substitute-form property (`h ← decode(encode(h))` preserves probe
+    pathogenicity predictions within tolerance). Currently fails on
+    Goodfire BRCA1 by a wide margin; preserved as a numerical receipt for
+    the 2026-05-19 `docs/decisions.md` entry and as a rerunnable check if
+    the SAE / layer / gene ever changes and we want to revisit whether the
+    substitute property holds.
+    """
+    import pytest
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    rc = pytest.main(["-xvs", "/tests/diagnostics/test_substitute_roundtrip.py"])
+    return {
+        "pytest_exit_code": int(rc),
+        "passed": int(rc) == 0,
+        "gene": gene,
+        "note": "diagnostic only — see docs/decisions.md 2026-05-19",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Week 4 gate diagnostic: confirm which side flattened + per-variant mask stats
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 15,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def diag_identity_roundtrip(
+    gene: str = "BRCA1",
+    n_variants: int = 200,
+    sequence_window: int = 512,
+) -> dict:
+    """
+    Companion to `test_identity_roundtrip` — same encoding recipe but
+    sampled (n_variants=200, ~1-2 min) and printing instead of asserting.
+    Confirms which side of the prediction distribution collapsed (NaN
+    Spearman in the failed test was caused by a constant array) and
+    surfaces per-variant mask-feature behaviour before/after the SAE
+    round-trip.
+
+    Reports:
+      - p_baseline / p_roundtrip: mean / std / min / max
+      - SAE recon rel_l2 at the variant position
+      - Per-variant mask L0 and Σf[mask] baseline vs round-trip
+      - Mask-set Jaccard(baseline, round-trip)
+      - Cosine similarity baseline vs round-trip (full feature vector + mask subset)
+    """
+    import numpy as np
+
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import add_sequence_column
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+    from causal_steering.utils.seeding import seed_everything
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    seed_everything(0)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    mask_ids = PathogenicityProbe.load_mask(mask_path)
+    mask_idx = np.array(mask_ids, dtype=np.int64)
+
+    df = load_clinvar(str(CLINVAR_PATH), gene=gene)
+    df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=sequence_window)
+    assert len(df) > 0
+    rng = np.random.default_rng(0)
+    take = min(n_variants, len(df))
+    idx = rng.choice(len(df), size=take, replace=False)
+    df = df.iloc[idx].reset_index(drop=True)
+    sequences = df["sequence"].tolist()
+    labels = df["label"].to_numpy()
+    variant_idx = sequence_window
+
+    evo = Evo2WithHook(
+        model_name="evo2_7b_262k", local_path=None, device="cuda", block_index=26
+    )
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device="cuda")
+
+    rel_l2s: list[float] = []
+    mask_sum_b: list[float] = []
+    mask_sum_r: list[float] = []
+    mask_l0_b: list[int] = []
+    mask_l0_r: list[int] = []
+    cos_full: list[float] = []
+    cos_mask: list[float] = []
+    jaccard: list[float] = []
+
+    X_base = np.empty((len(sequences), sae.n_features), dtype=np.float32)
+    X_round = np.empty_like(X_base)
+
+    for i, seq in enumerate(sequences):
+        hidden = evo.get_activations([seq])                  # [1, T, H]
+        recon = sae.reconstruct(hidden)                       # [1, T, H]
+
+        h_var = hidden[0, variant_idx, :].float()
+        r_var = recon[0, variant_idx, :].float()
+        denom = float(h_var.norm())
+        rel_l2s.append(
+            float((h_var - r_var).norm() / denom) if denom > 0 else float("nan")
+        )
+
+        f_base = sae.encode(hidden)[0, variant_idx, :].float()
+        f_round = sae.encode(recon)[0, variant_idx, :].float()
+        X_base[i] = f_base.cpu().numpy()
+        X_round[i] = f_round.cpu().numpy()
+
+        m_b = f_base[mask_idx]
+        m_r = f_round[mask_idx]
+        mask_sum_b.append(float(m_b.sum()))
+        mask_sum_r.append(float(m_r.sum()))
+        mask_l0_b.append(int((m_b != 0).sum()))
+        mask_l0_r.append(int((m_r != 0).sum()))
+
+        def _cos(a, b) -> float:
+            an = float(a.norm())
+            bn = float(b.norm())
+            return float(a @ b) / (an * bn) if an > 0 and bn > 0 else float("nan")
+
+        cos_full.append(_cos(f_base, f_round))
+        cos_mask.append(_cos(m_b, m_r))
+
+        b_set = set(np.where(X_base[i, mask_idx] != 0)[0].tolist())
+        r_set = set(np.where(X_round[i, mask_idx] != 0)[0].tolist())
+        if b_set or r_set:
+            jaccard.append(len(b_set & r_set) / len(b_set | r_set))
+        else:
+            jaccard.append(float("nan"))
+
+    # Refit probe on this sample. NOT identical to the Phase-0 probe (which
+    # is fit on all 2691 variants); a small-sample proxy that's good enough
+    # to reproduce the constant-collapse — if it happens here too, the
+    # failure mode is robust to probe identity.
+    n_classes = int(len(np.unique(labels)))
+    if n_classes < 2:
+        print(f"[diag] only one class in sample (n_classes={n_classes}); skipping probe")
+        p_base_stats = p_round_stats = None
+    else:
+        cv_folds = min(5, int(np.bincount(labels).min()))
+        probe = PathogenicityProbe()
+        cv = probe.fit(X_base, labels, cv_folds=max(cv_folds, 2))
+        assert probe._clf is not None
+        p_base = probe._clf.predict_proba(X_base)[:, 1]
+        p_round = probe._clf.predict_proba(X_round)[:, 1]
+        p_base_stats = {
+            "mean": float(p_base.mean()),
+            "std": float(p_base.std()),
+            "min": float(p_base.min()),
+            "max": float(p_base.max()),
+        }
+        p_round_stats = {
+            "mean": float(p_round.mean()),
+            "std": float(p_round.std()),
+            "min": float(p_round.min()),
+            "max": float(p_round.max()),
+        }
+
+    print(f"\n=== diag_identity_roundtrip [{gene}, n={len(sequences)}] ===")
+    if p_base_stats is not None:
+        print(f"refit probe small-sample CV AUC: {cv['cv_auc_mean']:.3f} ± {cv['cv_auc_std']:.3f}")
+        print(
+            f"p_baseline:  mean={p_base_stats['mean']:.4f}  std={p_base_stats['std']:.4f}  "
+            f"min={p_base_stats['min']:.4f}  max={p_base_stats['max']:.4f}"
+        )
+        print(
+            f"p_roundtrip: mean={p_round_stats['mean']:.4f}  std={p_round_stats['std']:.4f}  "
+            f"min={p_round_stats['min']:.4f}  max={p_round_stats['max']:.4f}"
+        )
+        deltas = np.abs(p_base - p_round)
+        print(f"  MAE={deltas.mean():.4f}  max|Δ|={deltas.max():.4f}")
+
+    print(
+        f"\nSAE recon rel_l2 at variant position (per-variant): "
+        f"mean={np.mean(rel_l2s):.3f}  median={np.median(rel_l2s):.3f}  "
+        f"min={np.min(rel_l2s):.3f}  max={np.max(rel_l2s):.3f}"
+    )
+    print(
+        f"\nMask features at variant position (|mask|={len(mask_ids)}):\n"
+        f"  baseline:  L0 mean={np.mean(mask_l0_b):.2f} median={np.median(mask_l0_b):.1f}  "
+        f"  Σf mean={np.mean(mask_sum_b):.3f}\n"
+        f"  roundtrip: L0 mean={np.mean(mask_l0_r):.2f} median={np.median(mask_l0_r):.1f}  "
+        f"  Σf mean={np.mean(mask_sum_r):.3f}"
+    )
+    print(
+        f"  mask-set Jaccard(baseline, roundtrip): "
+        f"mean={np.nanmean(jaccard):.3f}  median={np.nanmedian(jaccard):.3f}"
+    )
+
+    print(
+        f"\nCosine similarity (feats at variant position):\n"
+        f"  full 32768-dim: mean={np.nanmean(cos_full):.3f}  median={np.nanmedian(cos_full):.3f}\n"
+        f"  mask subset:    mean={np.nanmean(cos_mask):.3f}  median={np.nanmedian(cos_mask):.3f}"
+    )
+
+    out = {
+        "p_baseline": p_base_stats,
+        "p_roundtrip": p_round_stats,
+        "recon_rel_l2_mean": float(np.mean(rel_l2s)),
+        "recon_rel_l2_median": float(np.median(rel_l2s)),
+        "mask_l0_baseline_mean": float(np.mean(mask_l0_b)),
+        "mask_l0_roundtrip_mean": float(np.mean(mask_l0_r)),
+        "mask_sum_baseline_mean": float(np.mean(mask_sum_b)),
+        "mask_sum_roundtrip_mean": float(np.mean(mask_sum_r)),
+        "mask_jaccard_mean": float(np.nanmean(jaccard)),
+        "cos_full_mean": float(np.nanmean(cos_full)),
+        "cos_mask_mean": float(np.nanmean(cos_mask)),
+        "n_variants": int(len(sequences)),
+    }
     return out
 
 
@@ -1197,18 +1444,22 @@ def probe_hook_vs_vortex() -> dict:
         modal.Secret.from_name("wandb"),
     ],
 )
-def phase0(gene: str = "BRCA1") -> dict:
+def phase0(gene: str = "BRCA1", mask_size: int | None = None) -> dict:
     """
     Phase 0 end-to-end on Modal for one gene.
 
       modal run -m causal_steering.utils.modal_app::phase0 --gene BRCA1
+      modal run -m causal_steering.utils.modal_app::phase0 --gene BRCA1 --mask-size 1000
 
     Idempotently caches Evo 2 + SAE + ClinVar onto the Volume, composes the
-    Hydra `phase0` config inside the container with `gene=<gene>`, rewrites the
+    Hydra `phase0` config inside the container with `gene=<gene>` (and
+    `probe.feature_mask_size=<mask_size>` if provided), rewrites the
     on-Volume paths (clinvar, evo2 weights, output dir), then dispatches to
     `causal_steering.phase0.run_phase0`. Outputs land at
     `/weights/runs/phase0/<gene>/{feature_mask.json, guard.npz}` and the
-    probe CV AUC is logged to W&B.
+    probe CV AUC is logged to W&B. `mask_size=None` leaves the config
+    default (currently 100; see configs/phase0.yaml / decisions.md
+    2026-05-13 for the k=1000 rationale).
     """
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -1219,9 +1470,13 @@ def phase0(gene: str = "BRCA1") -> dict:
     cache_clinvar.local(force=False)
     cache_reference.local(gene=gene)
 
+    overrides = [f"gene={gene}"]
+    if mask_size is not None:
+        overrides.append(f"probe.feature_mask_size={mask_size}")
+
     # Configs are mounted at /configs by gpu_image.add_local_dir(...).
     with initialize_config_dir(config_dir="/configs", version_base=None):
-        cfg = compose(config_name="phase0", overrides=[f"gene={gene}"])
+        cfg = compose(config_name="phase0", overrides=overrides)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     assert isinstance(cfg_dict, dict)
 

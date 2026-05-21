@@ -2,6 +2,130 @@
 
 One-paragraph notes on locked decisions. Newest first.
 
+## 2026-05-19 — Week 4 gate reframed: delta-patch specificity, not substitute-form recon stability
+
+First version of the Week 4 prerequisite gate
+(`tests/test_identity_roundtrip.py`) asserted that the SAE *substitute*
+round-trip — `h ← decode(encode(h))`, with no steering applied — preserved
+probe pathogenicity predictions on the Phase-0 BRCA1 set within tolerance
+of the no-SAE baseline (MAE ≤ 0.10, max |Δ| ≤ 0.25, Spearman ρ ≥ 0.80).
+The first Modal run failed by a wide margin: MAE=0.328, max|Δ|=0.745,
+Spearman undefined because `p_roundtrip.std() = 0` — predictions collapsed
+to a constant at the LR intercept across all 2691 variants. The diagnostic
+sweep (`diag_identity_roundtrip`, n=200, sampled) confirmed the mechanism:
+mask L0 at the variant position dropped from 1.03 to 0.00, the
+mask-feature set Jaccard(baseline, roundtrip) was 0.000 on every sampled
+variant, and SAE recon rel_l2 at the variant position was 0.706 mean
+(0.92 worst). Compounding causes: (i) recon error at the variant position
+is much worse than the all-token average from `docs/goodfire_query.md`,
+and (ii) BatchTopK is a *global* top-64 over 32768 features, so even small
+recon-induced ranking noise on a re-encode evicts the entire k=100 mask
+out of the active set. The substitute gate was testing whether the SAE
+preserves *every* downstream activation property — a strictly stronger
+claim than steering's actual algebraic dependency.
+
+**The production patch (`steering/patch.py::make_patch_fn`) is delta-form**:
+it returns `h + (decode(steered_features) - decode(orig_features))`. With
+`steering_vector = ones(|mask|)` the delta is *identically zero* and the
+patched output is exact identity regardless of recon quality. Reconstruction
+error never enters the residual stream in the unsteered direction; it only
+appears as part of a *paired* difference, so any constant lossy term cancels.
+
+**The new gate is built around specificity, not recon stability.** That is
+the load-bearing property — not "delta passes trivially at identity," which
+is true by construction and therefore worthless as a signal. Specificity
+asks: at `scale ≠ 1`, does patching the *Phase-0 mask* produce a measurably
+larger output shift than patching the same number of *random non-mask*
+features? If hamming(mask_steered, baseline) ≈ hamming(random_null_steered,
+baseline), then the discriminative features identified by the probe aren't
+moving generation any more than arbitrary features would; BO is fitting
+noise and there is no pathogenicity-specific signal to extract. If the
+margin is positive and significant, BO has a real direction to climb.
+Identity-at-scale-1.0 byte-equality (existing assertion in
+`test_week3_hand_steer::identity_1x`) is promoted into the gate file as a
+construction sanity check, and coherence (valid ACGT for every patched
+generation) survives as a third assertion guarding against off-manifold
+collapse making the hamming comparison meaningless. Thresholds chosen for
+robustness against the BatchTopK sparsity finding in the 2026-05-13 ADR:
+the gate will currently fail on the k=100 mask (Week 3 step-2 hand-steer
+already showed scale=5× ≡ identity at that resolution) and pass once Phase
+0 is re-run with `probe.feature_mask_size=1000`. That coupling is
+intentional — it forces the configuration change the prior ADR already
+recommended.
+
+The substitute-form test is preserved at
+`tests/diagnostics/test_substitute_roundtrip.py` (Modal entrypoint
+`diag_substitute_roundtrip`) with the NaN-Spearman path fixed to surface
+the constant-prediction collapse explicitly rather than as an undefined
+warning. Not collected by the Week 4 gate Modal entrypoint; rerun if the
+SAE or layer changes and we want to revisit whether the stronger
+substitute-form property holds.
+
+**Follow-up (same day, k=100 gate run).** First run of the new gate at the
+current k=100 mask failed on the *identity* assertion, not specificity:
+`make_patch_fn` produced byte-different output from no-patch at
+`scale=ones(|mask|)` on the first variant (5-char shared prefix, then
+diverged; 11/16 tokens differed). Mechanism: the production patch applied
+the distribution guard *asymmetrically* — clipping the steered features
+but leaving `orig_features` unclipped — so at scale=1.0 the delta
+`decode(clip(orig)) − decode(orig)` is nonzero whenever any mask feature
+is out-of-band, which is precisely the case at the variant position (the
+probe selected the mask there for exactly that reason). The prior
+`test_week3_hand_steer::identity_1x` passed only because it used a
+single in-distribution BRCA1 mRNA reference prompt where mask features
+were mostly in-band; the new gate's variant sequences exposed the
+asymmetry. Resolution: `make_patch_fn` now clips both `orig` and
+`steered` with the same bounds. At scale=ones the two are equal before
+clipping → equal after clipping → delta identically zero → algebraic
+identity holds independent of OOB-ness. `clip_rates` continues to track
+only the steered side (the canary BO needs). New regression test
+`test_make_patch_fn_identity_is_noop_with_real_guard` pins this — it
+explicitly constructs OOB input under a real `DistributionGuard` and
+asserts the identity property survives. The symmetric clip also fixes a
+substantive BO bug nobody had flagged: under the prior asymmetric clip,
+`scale=1.0` was *not* the neutral point of the steering search — BO
+would have been optimising around a clip-perturbed origin instead of
+no-steering. Specificity has not yet been measured at k=100 (the
+identity failure stopped pytest early); next step is to re-run the gate
+with this fix.
+
+**Follow-up #2 (same day, gate re-run at k=100 post symmetric-clip).** All
+three assertions green. Specificity numbers @ scale=2.0:
+`mean_hamming(mask, baseline) = 1.250`,
+`mean_hamming(random_null, baseline) = 0.000` (exactly zero across 3 ×
+8 = 24 random non-mask subsets — confirms the math: random non-mask
+features have BatchTopK activation = 0 at every position, so steered
+scaling has no effect). Margin 1.25 just clears the 1.0 threshold, but
+the per-variant distribution `[0, 7, 3, 0, 0, 0, 0, 0]` shows the mean
+is driven by 2 of 8 variants; the other 6 produce no shift at all. With
+a different `VARIANT_SAMPLE_SEED` the gate could plausibly fail at
+k=100. So while k=100 technically passes the gate, **BO would have
+signal on only ~25% of variants** at that mask size — the test passing
+here is more a quirk of seed=0 catching 2 productive variants than a
+real endorsement of k=100. Re-ran Phase 0 with
+`probe.feature_mask_size=1000` per the 2026-05-13 ADR.
+
+**Follow-up #3 (same day, gate at k=1000).** All three assertions green
+with a healthy margin: `mean_hamming(mask)=4.625`,
+`mean_hamming(null)=0.833`, margin 3.79. Per-variant mask hammings
+`[7, 7, 5, 9, 0, 9, 0, 0]` — productive variants now 5/8 vs 2/8 at
+k=100, and the productive ones move 5–9 of 16 tokens. Mask shift grew
+3.7× going k=100 → k=1000, matching the L0-vs-k scaling predicted by
+the 2026-05-13 ADR (mask L0 at variant position grew 1.0 → 4.62 across
+the same sample). One nuance worth noting: the null floor is no longer
+strictly zero — one of three random non-mask subsets happened to
+include features that fire at the variant position on two variants and
+produced `hamming=10`. The random-null distribution is long-tailed and
+`N_NULL_TRIALS=3` gives a noisy floor estimate; for tighter
+characterisation later, bump to ~10 trials (cheap — ~5× the gate's
+specificity-loop time, still under 10 min total). For now, margin 3.79
+is decisive enough that the gate is unambiguous. **Week 4 GP run is
+unblocked on the k=1000 BRCA1 mask.** Three BRCA1 variants still show
+zero mask hamming under steering even at k=1000 — those variants will
+be invisible to BO; an interesting subgroup to investigate separately
+(maybe they're variants where the *baseline* mask L0 is zero
+intrinsically, not a steering issue).
+
 ## 2026-05-19 — Run both BayesOpt (GP+EI) and RL (PPO); stop calling GP+EI "RL"
 
 Proposal feedback flagged that the project was framed as "an RL loop" while
