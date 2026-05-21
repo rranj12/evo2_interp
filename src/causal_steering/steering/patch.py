@@ -30,6 +30,19 @@ def make_patch_fn(
         )
         steered_features = orig_features * scale
 
+        # Symmetric clip: apply the same guard bounds to both orig and
+        # steered so the delta is identically zero at scale=ones (the
+        # algebraic identity BO/PPO rely on). Asymmetric clipping —
+        # the prior implementation only clipped steered — injected
+        # decode(orig - clip(orig)) into the residual stream even at
+        # scale=1.0, perturbing greedy generation on inputs whose mask
+        # features were out-of-band (the variant position, by
+        # construction, is exactly such an input). See
+        # `docs/decisions.md` 2026-05-19 ("Week 4 gate reframed").
+        # `clip_rates` continues to track the steered side only — that
+        # is the canary BO needs (how often the policy is being clipped
+        # back toward the Phase-0 manifold).
+        orig_features, _ = guard_clip(orig_features, feature_ids)
         steered_features, rate = guard_clip(steered_features, feature_ids)
         clip_rates.append(rate)
 

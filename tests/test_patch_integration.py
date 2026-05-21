@@ -54,6 +54,46 @@ def test_make_patch_fn_identity_is_noop() -> None:
     assert clip_rates == [0.0], f"expected one zero clip-rate entry, got {clip_rates}"
 
 
+def test_make_patch_fn_identity_is_noop_with_real_guard() -> None:
+    """At scale=ones, make_patch_fn must be a pure no-op *even when a real
+    DistributionGuard is wired in and the input has out-of-band values at
+    masked positions* — symmetric clipping (introduced 2026-05-19) means
+    clip(orig) and clip(steered) cancel in the delta. The prior asymmetric
+    implementation injected decode(orig - clip(orig)) into the residual
+    stream and broke identity on variant-position activations; see
+    docs/decisions.md 2026-05-19."""
+    rng = np.random.default_rng(SEED)
+    train_acts = rng.standard_normal((512, N_FEATURES)).astype(np.float32)
+    guard = DistributionGuard(q_low=0.1, q_high=0.9)
+    guard.fit(train_acts)
+
+    # Large-magnitude input guarantees OOB at masked positions under
+    # q=[0.1, 0.9] — without symmetric clipping, identity was perturbed
+    # exactly here.
+    torch.manual_seed(SEED)
+    h = torch.randn(1, 4, N_FEATURES) * 5.0
+    feature_ids = [0, 1, 2]
+    vec = torch.ones(len(feature_ids))
+
+    patch_fn, clip_rates = make_patch_fn(
+        sae_encode=_identity_encode,
+        sae_decode=_identity_decode,
+        steering_vector=vec,
+        feature_ids=feature_ids,
+        guard_clip=guard.clip,
+    )
+
+    out = patch_fn(h)
+    assert torch.equal(out, h), (
+        "identity steer is not a pure no-op under a real guard: clip(orig) "
+        "and clip(steered) should cancel in the delta. Symmetric clipping "
+        "regression — see docs/decisions.md 2026-05-19."
+    )
+    assert clip_rates[0] > 0.0, (
+        "guard didn't fire on OOB input — this test is vacuous; check fixture"
+    )
+
+
 def test_make_patch_fn_records_clip_rate() -> None:
     """The real DistributionGuard.clip must produce a single entry in [0, 1]
     on the clip_rates list after one patch_fn call."""
