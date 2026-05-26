@@ -24,12 +24,30 @@ steering:
   n_iterations: 200
   n_warmup: 10
   eps: 0.001
+  # Stop after `patience` consecutive iters without > eps improvement in
+  # best-so-far reward (past warmup). Single-iter improvement is too tight
+  # with a 1000-D GP and only ~10 warmup observations — one unlucky GP
+  # suggestion would otherwise terminate the run before the optimizer had
+  # any information to work with.
+  patience: 30
   guard_quantile_low: 0.01
   guard_quantile_high: 0.99
 
 gp:
   bounds_low: 0.0
   bounds_high: 3.0
+  # Decouple search-dim from steer-dim. The patch still hits all |mask|
+  # features; the GP only optimizes in `search_dim` ≤ |mask|. 1-D + "uniform"
+  # is the sanity baseline (single scalar amplifies the whole mask) — if BO
+  # can't beat random here, the reward signal itself is flat and no
+  # higher-dim search will help.
+  search_dim: 1
+  projection: uniform
+  # Per-mask-feature sign of the Phase-0 probe coefficient (+1 / 0 / -1).
+  # Only required by `projection: pathogenic_split`; the Modal entrypoint
+  # populates this from /weights/runs/phase0/<gene>/mask_signs.json before
+  # constructing the policy. Leave null for the uniform projection.
+  signs: null
 
 acquisition:
   xi: 0.01

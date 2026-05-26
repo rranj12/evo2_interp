@@ -40,10 +40,14 @@ def run_steering_loop(
         "seed_anchors must align 1:1 with seed_sequences"
     )
     seed_everything(cfg.seed)
+    signs_cfg = cfg.gp.get("signs")
     policy = GPSteeringPolicy(
         n_features=len(feature_mask),
+        search_dim=int(cfg.gp.search_dim),
         bounds=(cfg.gp.bounds_low, cfg.gp.bounds_high),
         xi=cfg.acquisition.xi,
+        projection=cfg.gp.projection,
+        signs=list(signs_cfg) if signs_cfg is not None else None,
     )
 
     # Unsteered greedy baseline per seed, computed once and reused across iters.
@@ -65,6 +69,11 @@ def run_steering_loop(
         )
 
     trajectory: list[dict] = []
+    # Patience-window early-stop bookkeeping. `policy.improvement` (single-iter
+    # delta) is too tight in 1000-D BO; we tolerate `patience` consecutive
+    # non-improving iters past warmup before declaring convergence.
+    best_reward = -float("inf")
+    iters_since_improve = 0
 
     for i in range(cfg.steering.n_iterations):
         t0 = time.time()
@@ -95,7 +104,7 @@ def run_steering_loop(
         reward = float(sum(rewards) / len(rewards))
         clip_rate = float(sum(clip_rates) / len(clip_rates)) if clip_rates else 0.0
 
-        policy.update(steering_vec, reward)
+        policy.update(reward)
 
         record = {
             "iter": i,
@@ -106,11 +115,23 @@ def run_steering_loop(
         }
         trajectory.append(record)
 
-        best_reward = max(r["reward"] for r in trajectory)
-        wandb.log({"iter": i, "reward": reward, "best_reward": best_reward})
+        if reward > best_reward + cfg.steering.eps:
+            best_reward = reward
+            iters_since_improve = 0
+        else:
+            iters_since_improve += 1
+
+        wandb.log(
+            {
+                "iter": i,
+                "reward": reward,
+                "best_reward": best_reward,
+                "iters_since_improve": iters_since_improve,
+            }
+        )
         log_guard_clip_rate(clip_rate, step=i)
 
-        if policy.improvement < cfg.steering.eps and i >= cfg.steering.n_warmup:
+        if iters_since_improve >= cfg.steering.patience and i >= cfg.steering.n_warmup:
             break
 
     atlas = CausalAtlas.from_trajectory(trajectory, feature_mask, cfg.gene)
