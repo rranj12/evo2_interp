@@ -42,6 +42,20 @@ SAE_DIR = WEIGHTS_ROOT / "evo2_layer26_sae"
 CLINVAR_DIR = WEIGHTS_ROOT / "clinvar"
 CLINVAR_PATH = CLINVAR_DIR / "variant_summary.txt.gz"
 REFERENCE_DIR = WEIGHTS_ROOT / "reference" / "grch38"
+ALPHAMISSENSE_DIR = WEIGHTS_ROOT / "data" / "alphamissense"
+CADD_DIR = WEIGHTS_ROOT / "data" / "cadd"
+MAVE_DIR = WEIGHTS_ROOT / "data" / "mave"
+LIFTOVER_DIR = WEIGHTS_ROOT / ".liftover"
+
+ALPHAMISSENSE_URL = (
+    "https://storage.googleapis.com/dm_alphamissense/AlphaMissense_hg38.tsv.gz"
+)
+# CADD v1.7 GRCh38 whole-genome SNV file is bgzipped + tabix-indexed; we never
+# download it whole (~80 GB), only HTTP-range-fetch the gene window via tabix.
+CADD_URL = (
+    "https://krishna.gs.washington.edu/download/CADD/v1.7/GRCh38/"
+    "whole_genome_SNVs.tsv.gz"
+)
 
 # Single source of truth for model IDs. Loaders import these.
 EVO2_REPO_ID = "arcinstitute/evo2_7b"
@@ -51,7 +65,11 @@ gpu_image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11"
     )
-    .apt_install("git", "build-essential")
+    # `tabix` kept in the apt set only to preserve the image layer hash so
+    # Modal reuses the cached flash-attn build (which OOMs on rebuild). The
+    # CADD cache itself uses `pysam` (below) since Ubuntu's `tabix` is built
+    # without libcurl/HTTPS support.
+    .apt_install("git", "build-essential", "tabix", "curl")
     # Arc's Evo 2 README "Light installation" — torch first so flash-attn has
     # something to link against, then flash-attn (--no-build-isolation), then evo2.
     .pip_install(
@@ -69,6 +87,18 @@ gpu_image = (
     # explicitly so GPU-only entrypoints (e.g. test_week3_generation) can run
     # the test suite via pytest.main without needing the full dev extra.
     .pip_install("pytest>=8.0")
+    # `pysam` ships an htslib built with libcurl, which is what `cache_cadd`
+    # uses to HTTP-range-fetch CADD v1.7's bgzipped + tabix-indexed
+    # whole-genome SNV file for a per-gene window without pulling the ~80 GB
+    # full release. The apt `tabix` package on Ubuntu 22.04 is built without
+    # HTTPS support, hence pysam over apt.
+    .pip_install("pysam>=0.22")
+    # `pyliftover` is pure-Python and only used by `cache_mave` to convert
+    # Findlay 2018 supp-table hg19 coordinates to hg38 (matches the
+    # reference, AM, CADD on the Volume). Chain file is downloaded lazily
+    # on first instantiation; we point pyliftover at /weights/.liftover so
+    # the chain is cached on the Volume across runs.
+    .pip_install("pyliftover>=0.4")
     .env({"HF_HOME": "/weights/.hf_cache"})
     # Ship Hydra configs into the container so functions can compose() inside.
     # MUST be the last image step: Modal forbids further build steps after a
@@ -83,6 +113,13 @@ gpu_image = (
     .add_local_dir(
         str(Path(__file__).resolve().parents[3] / "tests"),
         "/tests",
+    )
+    # Ship the MAVE supplementary tables (Findlay 2018 only; see
+    # [[project-brca1-mave-dataset]] memory) so cache_mave can read them
+    # without a network hop. Both files together are ~8 MB.
+    .add_local_dir(
+        str(Path(__file__).resolve().parents[3] / "data" / "mave"),
+        "/data/mave",
     )
 )
 
@@ -205,6 +242,385 @@ def cache_reference(gene: str = "BRCA1") -> str:
     weights_volume.commit()
     print(f"[cache_reference] reference ready at {REFERENCE_DIR}: {[p.name for p in paths]}")
     return str(REFERENCE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# AlphaMissense + CADD caching (run once per gene; idempotent)
+# ---------------------------------------------------------------------------
+
+
+def _gene_region(gene: str, padding: int) -> tuple[str, int, int]:
+    """Return (`chrXX`, min_pos, max_pos) covering this gene's ClinVar variants,
+    padded by `padding` bp on each side. Callers run cache_clinvar.local first."""
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import _normalize_chrom
+
+    df = load_clinvar(CLINVAR_PATH, gene=gene)
+    chroms = sorted({_normalize_chrom(c) for c in df["chrom"].astype(str)})
+    if len(chroms) != 1:
+        raise ValueError(f"{gene} variants span multiple chromosomes: {chroms}")
+    return chroms[0], int(df["pos"].min()) - padding, int(df["pos"].max()) + padding
+
+
+@app.function(
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 45,
+)
+def cache_alphamissense(gene: str = "BRCA1", padding: int = 2048, force: bool = False) -> str:
+    """
+    Stream the public AlphaMissense hg38 tsv.gz (~5 GB compressed) through
+    gunzip + awk, keeping only rows inside `_gene_region(gene)`, and write a
+    canonical Parquet (`CHROM, POS, REF, ALT, am_pathogenicity`) to
+    /weights/data/alphamissense/<gene>.parquet. Idempotent.
+
+      modal run -m causal_steering.utils.modal_app::cache_alphamissense --gene BRCA1
+    """
+    import subprocess
+
+    import pandas as pd
+
+    cache_clinvar.local(force=False)
+    ALPHAMISSENSE_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = ALPHAMISSENSE_DIR / f"{gene}.parquet"
+    if out_path.exists() and not force:
+        print(f"[cache_alphamissense] already cached at {out_path}")
+        return str(out_path)
+
+    chrom, lo, hi = _gene_region(gene, padding=padding)
+    print(f"[cache_alphamissense] streaming {ALPHAMISSENSE_URL}")
+    print(f"[cache_alphamissense] filtering to {chrom}:{lo}-{hi}")
+
+    # AM hg38 columns: CHROM POS REF ALT genome uniprot_id transcript_id
+    #                  protein_variant am_pathogenicity am_class
+    awk = (
+        f'BEGIN{{FS=OFS="\\t"}} '
+        f'/^#/ {{next}} '
+        f'$1=="{chrom}" && $2+0>={lo} && $2+0<={hi}'
+    )
+    cmd = f"curl -fsSL '{ALPHAMISSENSE_URL}' | gunzip -c | awk '{awk}'"
+    print(f"[cache_alphamissense] running: {cmd[:120]}...")
+    proc = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+
+    rows = [line.split("\t") for line in proc.stdout.splitlines() if line]
+    if not rows:
+        raise RuntimeError(
+            f"no AlphaMissense rows for {gene} ({chrom}:{lo}-{hi}); "
+            "AM only covers protein-coding missense — verify the gene region is in-CDS"
+        )
+    cols = [
+        "CHROM", "POS", "REF", "ALT", "genome",
+        "uniprot_id", "transcript_id", "protein_variant",
+        "am_pathogenicity", "am_class",
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+    df["POS"] = df["POS"].astype(int)
+    df["am_pathogenicity"] = df["am_pathogenicity"].astype(float)
+    df = df[["CHROM", "POS", "REF", "ALT", "am_pathogenicity"]]
+    df.to_parquet(out_path, index=False)
+    weights_volume.commit()
+
+    print(
+        f"[cache_alphamissense] wrote {out_path} "
+        f"({len(df)} rows, pos range [{df['POS'].min()}, {df['POS'].max()}])"
+    )
+    return str(out_path)
+
+
+@app.function(
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 30,
+)
+def cache_cadd(gene: str = "BRCA1", padding: int = 2048, force: bool = False) -> str:
+    """
+    HTTP-range-fetch the CADD v1.7 whole-genome SNV slice for `gene`'s window
+    via `pysam.TabixFile` (htslib + libcurl), and write to
+    /weights/data/cadd/<gene>.tsv.gz. Idempotent. Avoids the ~80 GB download.
+
+      modal run -m causal_steering.utils.modal_app::cache_cadd --gene BRCA1
+    """
+    import gzip
+
+    import pysam
+
+    cache_clinvar.local(force=False)
+    CADD_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = CADD_DIR / f"{gene}.tsv.gz"
+    if out_path.exists() and not force:
+        print(f"[cache_cadd] already cached at {out_path}")
+        return str(out_path)
+
+    chrom, lo, hi = _gene_region(gene, padding=padding)
+    # CADD v1.7 GRCh38 uses ENSEMBL-style "17", not UCSC "chr17", on the bgzip.
+    chrom_tabix = chrom.removeprefix("chr")
+    print(f"[cache_cadd] pysam tabix range fetch {chrom_tabix}:{lo}-{hi} from {CADD_URL}")
+
+    tbx = pysam.TabixFile(CADD_URL)
+    try:
+        header_lines = list(tbx.header)  # bytes or str depending on pysam version
+        header_lines = [
+            h.decode() if isinstance(h, bytes) else h for h in header_lines
+        ]
+        data_header = next(
+            (h for h in header_lines if h.startswith("#Chrom")),
+            "#Chrom\tPos\tRef\tAlt\tRawScore\tPHRED",
+        )
+        rows = list(tbx.fetch(chrom_tabix, lo - 1, hi))  # tabix is 0-based half-open
+    finally:
+        tbx.close()
+
+    if not rows:
+        raise RuntimeError(
+            f"no CADD rows for {gene} ({chrom_tabix}:{lo}-{hi}); "
+            "verify the chromosome label on the bgzip matches"
+        )
+
+    # Canonicalize chrom label to UCSC-style ("17" → "chr17") so lookups keyed
+    # on `anchor.chrom` (always "chrXX") match.
+    fixed_rows: list[str] = []
+    for line in rows:
+        s = line.decode() if isinstance(line, bytes) else line
+        parts = s.split("\t")
+        if parts and not parts[0].startswith("chr"):
+            parts[0] = f"chr{parts[0]}"
+        fixed_rows.append("\t".join(parts))
+
+    with gzip.open(out_path, "wt") as f:
+        f.write(data_header.rstrip("\n") + "\n")
+        f.write("\n".join(fixed_rows) + "\n")
+    weights_volume.commit()
+
+    print(f"[cache_cadd] wrote {out_path} ({len(fixed_rows)} rows)")
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# MAVE caching (Findlay 2018; idempotent)
+# ---------------------------------------------------------------------------
+
+
+# Hard-coded MaveDB URN for the BRCA1 scoreset this project is built against.
+# Refuse to silently swap in the 2025 Findlay preprint — see
+# [[project-brca1-mave-dataset]] memory and `data/mave.py` for context.
+FINDLAY_2018_BRCA1_URN = "urn:mavedb:00000003-a-1"
+FINDLAY_2018_SUPP_PATH = "/data/mave/findlay_2018_supp.csv"
+
+
+@app.function(
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 30,
+)
+def cache_mave(gene: str = "BRCA1", force: bool = False) -> str:
+    """
+    Load the Findlay 2018 Nature supplementary table from the mounted CSV,
+    filter to single SNVs in `gene`, liftOver hg19 → hg38 with pyliftover,
+    and write a canonical parquet to /weights/data/mave/<gene>.parquet.
+
+    Parquet schema: chrom (UCSC "chr17"), pos (hg38, 1-based), ref, alt,
+    score, function_class, consequence, pos_hg19. Tagged with metadata
+    `source=Findlay_2018_<URN>` so downstream code cannot mistake this for
+    the 2025 preprint.
+
+      modal run -m causal_steering.utils.modal_app::cache_mave --gene BRCA1
+    """
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from pyliftover import LiftOver
+
+    from causal_steering.data.mave import FINDLAY_2018_URN, load_findlay_supp
+
+    assert FINDLAY_2018_URN == FINDLAY_2018_BRCA1_URN, (
+        "MAVE URN drift between cache_mave and src/causal_steering/data/mave.py"
+    )
+
+    MAVE_DIR.mkdir(parents=True, exist_ok=True)
+    LIFTOVER_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = MAVE_DIR / f"{gene}.parquet"
+    if out_path.exists() and not force:
+        print(f"[cache_mave] already cached at {out_path}")
+        return str(out_path)
+
+    df = load_findlay_supp(FINDLAY_2018_SUPP_PATH, gene=gene)
+    print(
+        f"[cache_mave] loaded {len(df)} {gene} SNVs from supp table "
+        f"({FINDLAY_2018_BRCA1_URN})"
+    )
+
+    # pyliftover caches the chain under ~ by default; redirect to the Volume
+    # so subsequent runs reuse it.
+    import os
+
+    os.environ["XDG_CACHE_HOME"] = str(LIFTOVER_DIR)
+    lo = LiftOver("hg19", "hg38")
+
+    rows_hg38: list[dict] = []
+    n_no_lift = 0
+    for r in df.itertuples(index=False):
+        # pyliftover uses 0-based input
+        hits = lo.convert_coordinate(r.chrom, r.pos_hg19 - 1)
+        if not hits:
+            n_no_lift += 1
+            continue
+        new_chrom, new_pos0, _, _ = hits[0]
+        if new_chrom != r.chrom:
+            # rare; an alt-locus liftOver. Skip rather than silently relocate.
+            n_no_lift += 1
+            continue
+        rows_hg38.append(
+            {
+                "chrom": new_chrom,
+                "pos": int(new_pos0) + 1,
+                "ref": r.ref,
+                "alt": r.alt,
+                "score": float(r.score),
+                "function_class": r.function_class,
+                "consequence": r.consequence,
+                "pos_hg19": int(r.pos_hg19),
+            }
+        )
+    out = pd.DataFrame(rows_hg38)
+    if out.empty:
+        raise RuntimeError(
+            f"liftOver dropped every row for {gene} ({len(df)} input rows)"
+        )
+
+    table = pa.Table.from_pandas(out, preserve_index=False)
+    table = table.replace_schema_metadata(
+        {b"source": f"Findlay_2018_{FINDLAY_2018_BRCA1_URN}".encode()}
+    )
+    pq.write_table(table, out_path)
+    weights_volume.commit()
+
+    print(
+        f"[cache_mave] wrote {out_path}  "
+        f"{len(out)} hg38 rows  (dropped {n_no_lift} on liftOver)  "
+        f"pos range [{out['pos'].min()}, {out['pos'].max()}]"
+    )
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 probe-coefficient signs (Week 4 BO follow-up; idempotent)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 60,
+    secrets=[modal.Secret.from_name("huggingface")],
+)
+def cache_mask_signs(
+    gene: str = "BRCA1",
+    sequence_window: int = 512,
+    force: bool = False,
+) -> str:
+    """
+    Refit the Phase-0 logistic probe under the same RNG Phase 0 used, recover
+    the signed coefficient for each feature in the saved mask, and persist a
+    sign-aligned artifact to
+    `/weights/runs/phase0/<gene>/mask_signs.json`.
+
+    Consumed by the `pathogenic_split` BO projection — splits the k=1000
+    mask into pathogenic-positive vs pathogenic-negative subsets so a 2-D
+    BO can express "amplify one, suppress the other", which is the
+    hypothesis the uniform-1D projection couldn't.
+
+    Sanity-checks that refit top-|coef| of size |mask| reproduces the
+    saved feature_ids set exactly. Mismatch ⇒ Phase 0 RNG drift; surface
+    instead of silently shipping a misaligned sign vector.
+    """
+    import json
+
+    import numpy as np
+
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import add_sequence_column
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+    from causal_steering.utils.seeding import seed_everything
+
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    signs_path = phase0_dir / "mask_signs.json"
+    assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    if signs_path.exists() and not force:
+        print(f"[cache_mask_signs] already cached at {signs_path}")
+        return str(signs_path)
+
+    feature_ids = PathogenicityProbe.load_mask(mask_path)
+    print(f"[cache_mask_signs] refit on {gene}, |mask|={len(feature_ids)}")
+
+    # Match Phase 0's RNG so probe coefs are deterministic with the saved mask.
+    seed_everything(0)
+
+    df = load_clinvar(str(CLINVAR_PATH), gene=gene)
+    df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=sequence_window)
+    assert len(df) > 0, "all variants dropped during sequence extraction"
+    sequences = df["sequence"].tolist()
+    labels = df["label"].to_numpy()
+    variant_idx = sequence_window
+    print(f"[cache_mask_signs] {len(df)} {gene} variants survived sequence extraction")
+
+    evo2 = Evo2WithHook(
+        model_name="evo2_7b_262k", local_path=None, device="cuda", block_index=26
+    )
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device="cuda")
+
+    feats: list[np.ndarray] = []
+    for seq in sequences:
+        hidden = evo2.get_activations([seq])
+        f = sae.encode(hidden)[0, variant_idx, :]
+        feats.append(f.cpu().float().numpy())
+    X = np.stack(feats, axis=0)
+
+    probe = PathogenicityProbe()
+    cv = probe.fit(X, labels, cv_folds=5)
+    assert probe._clf is not None
+    coefs_full = probe._clf.coef_[0]
+
+    # Sanity vs saved mask.
+    refit_top = np.argsort(np.abs(coefs_full))[::-1][: len(feature_ids)].tolist()
+    refit_matches = set(refit_top) == set(feature_ids)
+    print(
+        f"[cache_mask_signs] refit AUC={cv['cv_auc_mean']:.3f}±{cv['cv_auc_std']:.3f}  "
+        f"top-{len(feature_ids)} ≡ saved mask: {refit_matches}"
+    )
+    if not refit_matches:
+        diff = set(refit_top) ^ set(feature_ids)
+        raise RuntimeError(
+            f"refit top-{len(feature_ids)} does not match saved mask "
+            f"(symmetric difference = {len(diff)} ids); "
+            "Phase 0 RNG drift — re-run Phase 0 before trusting these signs"
+        )
+
+    signs = [int(np.sign(coefs_full[fid])) for fid in feature_ids]
+    out = {
+        "feature_ids": feature_ids,
+        "signs": signs,
+        "n_pos": int(sum(s > 0 for s in signs)),
+        "n_neg": int(sum(s < 0 for s in signs)),
+        "n_zero": int(sum(s == 0 for s in signs)),
+        "refit_auc_mean": float(cv["cv_auc_mean"]),
+        "refit_auc_std": float(cv["cv_auc_std"]),
+        "refit_top_k_matches_saved": True,
+    }
+    signs_path.write_text(json.dumps(out, indent=2))
+    weights_volume.commit()
+    print(
+        f"[cache_mask_signs] wrote {signs_path}  "
+        f"n_pos={out['n_pos']}  n_neg={out['n_neg']}  n_zero={out['n_zero']}"
+    )
+    return str(signs_path)
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +1190,6 @@ def diag_variant_position_l0(
     doing real work; ~0.1 would be a serious problem.
     """
     import numpy as np
-    import torch
     import wandb
 
     from causal_steering.data.clinvar import load_clinvar
@@ -1508,6 +1923,549 @@ def phase0(gene: str = "BRCA1", mask_size: int | None = None) -> dict:
         print(f"\nFAIL: probe AUC {auc:.3f}, see ROADMAP risk log")
 
     return {**result, "output_dir": str(out_dir)}
+
+
+# ---------------------------------------------------------------------------
+# Week 4: BayesOpt (GP + EI) steering run for one (gene, seed)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 60 * 6,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def run_steering_bayesopt(
+    gene: str = "BRCA1",
+    seed: int = 0,
+    n_seed_sequences: int = 10,
+    search_dim: int | None = None,
+    projection: str | None = None,
+) -> dict:
+    """
+    Week 4 BayesOpt arm: GP + EI steering loop for one (gene, seed) on Modal.
+
+      modal run -m causal_steering.utils.modal_app::run_steering_bayesopt \\
+          --gene BRCA1 --seed 0
+      modal run -m causal_steering.utils.modal_app::run_steering_bayesopt \\
+          --gene BRCA1 --seed 0 --search-dim 2 --projection pathogenic_split
+
+    Pre-flight (all idempotent): Evo 2 + SAE weights, ClinVar, GRCh38
+    chromosomes, AlphaMissense slice, CADD slice. When the projection
+    requires per-mask-feature signs, `cache_mask_signs(gene)` is also run
+    so /weights/runs/phase0/<gene>/mask_signs.json is populated. Phase 0
+    outputs (feature_mask.json + guard.npz) MUST already be on the Volume.
+
+    Composes the Hydra `steering` config inside the container, rewrites the
+    Volume paths, builds 1:1 (seed_sequence, seed_anchor) pairs from the
+    first `n_seed_sequences` ClinVar variants, runs the loop, and writes
+    `/weights/runs/steering/<gene>/bayesopt/seed_<seed>/{trajectory.json,
+    atlas.json}`.
+    """
+    import json
+
+    import wandb
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from causal_steering.data.clinvar import load_clinvar
+    from causal_steering.data.sequence import _normalize_chrom, add_sequence_column
+    from causal_steering.eval.fast_reward import SeedAnchor
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+    from causal_steering.steering.guard import DistributionGuard
+    from causal_steering.steering.loop import run_steering_loop
+    from causal_steering.utils.logging import init_wandb
+    from causal_steering.utils.seeding import seed_everything
+
+    # ---- Pre-flight caches ----------------------------------------------------
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+    cache_alphamissense.local(gene=gene)
+    cache_cadd.local(gene=gene)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    guard_path = phase0_dir / "guard.npz"
+    assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    assert guard_path.exists(), f"missing {guard_path} — run phase0 first"
+
+    # ---- Compose Hydra steering config + rewrite paths to Volume -------------
+    overrides = [f"gene={gene}", f"seed={seed}", "method=bayesopt"]
+    if search_dim is not None:
+        overrides.append(f"gp.search_dim={int(search_dim)}")
+    if projection is not None:
+        overrides.append(f"gp.projection={projection}")
+    with initialize_config_dir(config_dir="/configs", version_base=None):
+        cfg = compose(config_name="steering", overrides=overrides)
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(cfg_dict, dict)
+
+    cfg_dict.setdefault("data", {})["clinvar_path"] = str(CLINVAR_PATH)
+    cfg_dict["data"]["reference_path"] = str(REFERENCE_DIR)
+    cfg_dict["data"]["alphamissense_path"] = str(ALPHAMISSENSE_DIR / f"{gene}.parquet")
+    cfg_dict["data"]["cadd_path"] = str(CADD_DIR / f"{gene}.tsv.gz")
+    cfg_dict["feature_mask_path"] = str(mask_path)
+    out_dir = WEIGHTS_ROOT / "runs" / "steering" / gene / "bayesopt" / f"seed_{seed}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg_dict["output_dir"] = str(out_dir)
+
+    # Populate per-mask-feature signs when the projection needs them.
+    # `cache_mask_signs` is idempotent; refits Phase 0 probe under matching
+    # RNG and persists `mask_signs.json` aligned 1:1 with feature_mask.json.
+    if cfg_dict["gp"]["projection"] == "pathogenic_split":
+        cache_mask_signs.local(gene=gene)
+        signs_payload = json.loads(
+            (phase0_dir / "mask_signs.json").read_text()
+        )
+        assert signs_payload["feature_ids"] == PathogenicityProbe.load_mask(
+            mask_path
+        ), "mask_signs.json feature_ids drifted from feature_mask.json"
+        cfg_dict["gp"]["signs"] = signs_payload["signs"]
+        print(
+            f"[run_steering_bayesopt] loaded {len(signs_payload['signs'])} signs "
+            f"(n_pos={signs_payload['n_pos']} n_neg={signs_payload['n_neg']} "
+            f"n_zero={signs_payload['n_zero']})"
+        )
+
+    cfg = OmegaConf.create(cfg_dict)
+    seed_everything(int(cfg.seed))
+    init_wandb(cfg, job_type="steering")
+    if wandb.run is not None:
+        wandb.run.tags = tuple(set(wandb.run.tags or ()) | {"bayesopt", f"seed_{seed}"})
+
+    # ---- Mask + guard ---------------------------------------------------------
+    feature_mask = PathogenicityProbe.load_mask(mask_path)
+    guard = DistributionGuard.load(guard_path)
+    print(
+        f"[run_steering_bayesopt] gene={gene} seed={seed} "
+        f"|mask|={len(feature_mask)} guard.q=[{guard.q_low}, {guard.q_high}]"
+    )
+
+    # ---- Models ---------------------------------------------------------------
+    evo2 = Evo2WithHook(
+        model_name=cfg.evo2.model_name,
+        local_path=None,
+        device=cfg.evo2.device,
+        block_index=int(cfg.layer),
+    )
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device=cfg.evo2.device)
+
+    # ---- Seed sequences + anchors --------------------------------------------
+    # `add_sequence_column` slices forward-strand chromosomal windows of
+    # length 2*window+1 centred on each variant; the anchor for seed[0] is
+    # therefore always strand="+" and start = pos - window (1-based genomic).
+    window = int(cfg.data.sequence_window)
+    df = load_clinvar(str(CLINVAR_PATH), gene=gene)
+    df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=window)
+    if df.attrs.get("n_dropped_sequence", 0):
+        print(
+            f"[run_steering_bayesopt] dropped {df.attrs['n_dropped_sequence']} "
+            f"variants during sequence extraction "
+            f"(ref_mismatch={df.attrs.get('n_ref_mismatch')}, "
+            f"edge={df.attrs.get('n_edge')}, "
+            f"non_snv={df.attrs.get('n_non_snv')})"
+        )
+    assert len(df) >= n_seed_sequences, (
+        f"only {len(df)} {gene} variants survived sequence extraction; "
+        f"need at least {n_seed_sequences} for the steering loop"
+    )
+    df = df.head(n_seed_sequences).reset_index(drop=True)
+
+    seed_sequences = df["sequence"].tolist()
+    seed_anchors = [
+        SeedAnchor(
+            chrom=_normalize_chrom(str(row["chrom"])),
+            start=int(row["pos"]) - window,
+            strand="+",
+        )
+        for _, row in df.iterrows()
+    ]
+
+    # ---- Run the loop ---------------------------------------------------------
+    trajectory, atlas = run_steering_loop(
+        cfg=cfg,
+        feature_mask=feature_mask,
+        evo2=evo2,
+        sae=sae,
+        guard=guard,
+        seed_sequences=seed_sequences,
+        seed_anchors=seed_anchors,
+    )
+
+    # ---- Persist artifacts ----------------------------------------------------
+    traj_path = out_dir / "trajectory.json"
+    atlas_path = out_dir / "atlas.json"
+    with open(traj_path, "w") as f:
+        json.dump(trajectory, f, indent=2)
+    atlas.save(atlas_path)
+    weights_volume.commit()
+
+    summary = {
+        "gene": gene,
+        "seed": int(seed),
+        "method": "bayesopt",
+        "n_iterations": atlas.n_iterations,
+        "best_reward": atlas.best_reward,
+        "trajectory_path": str(traj_path),
+        "atlas_path": str(atlas_path),
+    }
+    wandb.log(
+        {"summary/best_reward": atlas.best_reward, "summary/n_iter": atlas.n_iterations}
+    )
+    wandb.finish()
+    print(f"[run_steering_bayesopt] done: {summary}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Week 4 go/no-go: MAVE Spearman eval against a trained atlas
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=gpu_image,
+    volumes={"/weights": weights_volume},
+    timeout=60 * 60 * 4,
+    secrets=[
+        modal.Secret.from_name("huggingface"),
+        modal.Secret.from_name("wandb"),
+    ],
+)
+def eval_atlas_mave(
+    gene: str = "BRCA1",
+    seed: int = 0,
+    method: str = "bayesopt",
+    n_mave_variants: int | None = None,
+    batch_size: int = 25,
+    consequence_filter: str | None = None,
+    rho_threshold: float = 0.10,
+) -> dict:
+    """
+    Week 4 go/no-go: held-out MAVE Spearman against a trained atlas.
+
+      modal run -m causal_steering.utils.modal_app::eval_atlas_mave \\
+          --gene BRCA1 --seed 0
+      modal run -m causal_steering.utils.modal_app::eval_atlas_mave \\
+          --gene BRCA1 --seed 0 --n-mave-variants 500   # quick subsample
+
+    Pipeline:
+      1. Reconstruct the best steering vector from
+         `/weights/runs/steering/<gene>/<method>/seed_<seed>/atlas.json`
+         (aligned 1:1 with `feature_mask.json`).
+      2. Load the cached Findlay 2018 MAVE table (hg38) from
+         `/weights/data/mave/<gene>.parquet`.
+      3. For each MAVE variant: build a ±sequence_window forward-strand seed
+         from GRCh38 (same loader the steering loop used), batched
+         steered + unsteered generation, compute per-variant fast reward
+         (AM + CADD over the steered-vs-unsteered SNV diff).
+      4. Spearman against MAVE function score for three predictors:
+           steered_reward      — trained policy generalized to held-out variants
+           am_lookup           — AlphaMissense at the variant itself
+                                 (the baseline the ROADMAP Week-4 gate names)
+           random_reward       — same pipeline, random vector in [0, bounds_high]²
+                                 same parameterization as the trained policy
+      5. Pre-committed verdict (locked before dispatch):
+           PASS      |ρ_steer| > |ρ_AM|  AND  ρ_steer < 0  AND  p_steer < 0.05
+           MARGINAL  |ρ_steer| > rho_threshold (default 0.10)  AND  ρ_steer < 0
+                     AND  |ρ_steer| ≤ |ρ_AM|
+           FAIL      otherwise
+         Underpowered if `n_matched < 100`; verdict is still emitted but
+         flagged.
+
+    `consequence_filter`: optional Findlay consequence to keep
+    ("Missense" / "Nonsense" / "Synonymous" / "Splice region" / ...). None
+    keeps all SNVs.
+    """
+    import json
+
+    import numpy as np
+    import pandas as pd
+    import torch
+    import wandb
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+    from scipy.stats import spearmanr
+
+    from causal_steering.data.alphamissense import lookup_am_score
+    from causal_steering.data.sequence import _normalize_chrom, variant_to_sequence
+    from causal_steering.eval.atlas import CausalAtlas
+    from causal_steering.eval.fast_reward import SeedAnchor, compute_fast_reward
+    from causal_steering.models.evo2 import Evo2WithHook
+    from causal_steering.models.probe import PathogenicityProbe
+    from causal_steering.models.sae import BatchTopKSAE
+    from causal_steering.steering.guard import DistributionGuard
+    from causal_steering.steering.patch import make_patch_fn
+    from causal_steering.utils.logging import init_wandb
+    from causal_steering.utils.seeding import seed_everything
+
+    # ---- Pre-flight caches ----------------------------------------------------
+    cache_weights.local(force=False)
+    cache_clinvar.local(force=False)
+    cache_reference.local(gene=gene)
+    cache_alphamissense.local(gene=gene)
+    cache_cadd.local(gene=gene)
+    cache_mave.local(gene=gene)
+
+    phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
+    mask_path = phase0_dir / "feature_mask.json"
+    guard_path = phase0_dir / "guard.npz"
+    atlas_path = (
+        WEIGHTS_ROOT
+        / "runs"
+        / "steering"
+        / gene
+        / method
+        / f"seed_{seed}"
+        / "atlas.json"
+    )
+    mave_path = MAVE_DIR / f"{gene}.parquet"
+    assert atlas_path.exists(), f"missing {atlas_path} — run the steering loop first"
+    assert mask_path.exists(), f"missing {mask_path}"
+    assert guard_path.exists(), f"missing {guard_path}"
+    assert mave_path.exists(), f"missing {mave_path} — cache_mave failed"
+
+    # ---- Compose Hydra config for reward weights + paths ---------------------
+    with initialize_config_dir(config_dir="/configs", version_base=None):
+        cfg = compose(config_name="steering", overrides=[f"gene={gene}", f"seed={seed}"])
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(cfg_dict, dict)
+    cfg_dict["data"]["alphamissense_path"] = str(ALPHAMISSENSE_DIR / f"{gene}.parquet")
+    cfg_dict["data"]["cadd_path"] = str(CADD_DIR / f"{gene}.tsv.gz")
+    cfg = OmegaConf.create(cfg_dict)
+
+    seed_everything(int(cfg.seed))
+    init_wandb(cfg, job_type="eval_mave")
+    if wandb.run is not None:
+        wandb.run.tags = tuple(
+            set(wandb.run.tags or ()) | {method, f"seed_{seed}", "eval_mave"}
+        )
+
+    # ---- Reconstruct best steering vector from atlas -------------------------
+    atlas = CausalAtlas.load(atlas_path)
+    feature_mask = PathogenicityProbe.load_mask(mask_path)
+    guard = DistributionGuard.load(guard_path)
+    best_by_fid = {e.feature_id: e.best_weight for e in atlas.feature_effects}
+    best_vec = torch.tensor(
+        [best_by_fid[fid] for fid in feature_mask], dtype=torch.double
+    )
+    print(
+        f"[eval_atlas_mave] atlas: n_iter={atlas.n_iterations} "
+        f"best_reward={atlas.best_reward:.4f}  |mask|={len(feature_mask)}"
+    )
+    print(
+        f"[eval_atlas_mave] best_vec stats: "
+        f"min={best_vec.min().item():.4f}  max={best_vec.max().item():.4f}  "
+        f"mean={best_vec.mean().item():.4f}  unique~={len(best_vec.unique())}"
+    )
+
+    # ---- Load MAVE + assemble per-variant seeds/anchors ----------------------
+    mave_df = pd.read_parquet(mave_path)
+    print(f"[eval_atlas_mave] loaded {len(mave_df)} {gene} MAVE rows from {mave_path}")
+    if consequence_filter is not None:
+        mave_df = mave_df[mave_df["consequence"] == consequence_filter].copy()
+        print(
+            f"[eval_atlas_mave] consequence_filter={consequence_filter!r}: "
+            f"kept {len(mave_df)} rows"
+        )
+    if n_mave_variants is not None and len(mave_df) > n_mave_variants:
+        mave_df = mave_df.sample(n=n_mave_variants, random_state=int(cfg.seed)).reset_index(
+            drop=True
+        )
+        print(f"[eval_atlas_mave] subsampled to {len(mave_df)} variants")
+    mave_df = mave_df.reset_index(drop=True)
+
+    window = int(cfg.data.sequence_window)
+    seeds: list[str] = []
+    anchors: list[SeedAnchor] = []
+    keep_idx: list[int] = []
+    for i, r in mave_df.iterrows():
+        try:
+            seq = variant_to_sequence(
+                REFERENCE_DIR, r.chrom, int(r.pos), r.ref, r.alt, window=window
+            )
+        except (IndexError, ValueError):
+            continue
+        # Ref-mismatch is hard-fail: GRCh38 disagrees with the MAVE row.
+        # `variant_to_sequence` raises RefMismatchError (subclass of
+        # ValueError) which we just caught — that's intentional. Skip.
+        seeds.append(seq)
+        anchors.append(
+            SeedAnchor(
+                chrom=_normalize_chrom(str(r.chrom)),
+                start=int(r.pos) - window,
+                strand="+",
+            )
+        )
+        keep_idx.append(i)
+    mave_df = mave_df.iloc[keep_idx].reset_index(drop=True)
+    print(
+        f"[eval_atlas_mave] {len(seeds)} variants survived sequence extraction "
+        f"(of {len(keep_idx)} candidates after subsample/filter)"
+    )
+
+    # ---- Models ---------------------------------------------------------------
+    evo2 = Evo2WithHook(
+        model_name=cfg.evo2.model_name,
+        local_path=None,
+        device=cfg.evo2.device,
+        block_index=int(cfg.layer),
+    )
+    sae = BatchTopKSAE(model_id=str(SAE_DIR), device=cfg.evo2.device)
+    max_new_tokens = int(cfg.evo2.max_new_tokens)
+
+    # ---- Random-vector control (same parameterization as the trained policy) -
+    rng = np.random.default_rng(int(cfg.seed))
+    random_vec = torch.tensor(
+        rng.uniform(float(cfg.gp.bounds_low), float(cfg.gp.bounds_high), size=len(feature_mask)),
+        dtype=torch.double,
+    )
+
+    def _per_variant_rewards(steering_vec: torch.Tensor, label: str) -> list[float]:
+        """Generate steered + unsteered for every MAVE variant and compute
+        per-variant fast reward. Batched over seeds for throughput."""
+        rewards: list[float] = []
+        patch_fn, _clip_rates = make_patch_fn(
+            sae_encode=sae.encode,
+            sae_decode=sae.decode,
+            steering_vector=steering_vec,
+            feature_ids=feature_mask,
+            guard_clip=guard.clip,
+        )
+        n = len(seeds)
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_seeds = seeds[start:end]
+            batch_anchors = anchors[start:end]
+            steered = evo2.generate_with_patch(
+                seed_sequences=batch_seeds,
+                patch_fn=patch_fn,
+                max_new_tokens=max_new_tokens,
+                temperature=0,
+            )
+            unsteered = evo2.generate_with_patch(
+                seed_sequences=batch_seeds,
+                patch_fn=None,
+                max_new_tokens=max_new_tokens,
+                temperature=0,
+            )
+            for seed_seq, gen, base, anchor in zip(
+                batch_seeds, steered, unsteered, batch_anchors, strict=True
+            ):
+                r = compute_fast_reward(cfg, seed_seq, gen, base, anchor)
+                rewards.append(r["reward"])
+            print(
+                f"[{label}] batch {start // batch_size + 1}/"
+                f"{(n + batch_size - 1) // batch_size}: "
+                f"variants {start}..{end - 1} done"
+            )
+        return rewards
+
+    print(f"[eval_atlas_mave] computing steered rewards over {len(seeds)} variants…")
+    steered_rewards = _per_variant_rewards(best_vec, "steered")
+    print("[eval_atlas_mave] computing random-vector rewards…")
+    random_rewards = _per_variant_rewards(random_vec, "random")
+
+    # ---- AM-only baseline (no Evo 2 needed) ---------------------------------
+    am_scores: list[float] = []
+    n_am_missing = 0
+    for r in mave_df.itertuples(index=False):
+        am = lookup_am_score(
+            cfg.data.alphamissense_path, r.chrom, int(r.pos), r.ref, r.alt
+        )
+        if am is None:
+            am_scores.append(float("nan"))
+            n_am_missing += 1
+        else:
+            am_scores.append(float(am))
+    print(
+        f"[eval_atlas_mave] AM lookup: {len(am_scores) - n_am_missing}/{len(am_scores)} "
+        f"variants scored ({n_am_missing} missing)"
+    )
+
+    # ---- Spearmans -----------------------------------------------------------
+    mave_scores = mave_df["score"].to_numpy()
+    steered_arr = np.array(steered_rewards)
+    random_arr = np.array(random_rewards)
+    am_arr = np.array(am_scores)
+
+    def _rho(pred: np.ndarray) -> tuple[float, float, int]:
+        finite = np.isfinite(pred) & np.isfinite(mave_scores)
+        if finite.sum() < 2:
+            return float("nan"), float("nan"), int(finite.sum())
+        r, p = spearmanr(pred[finite], mave_scores[finite])
+        return float(r), float(p), int(finite.sum())
+
+    rho_s, p_s, n_s = _rho(steered_arr)
+    rho_a, p_a, n_a = _rho(am_arr)
+    rho_r, p_r, n_r = _rho(random_arr)
+
+    # ---- Pre-committed verdict ----------------------------------------------
+    abs_s = abs(rho_s) if not np.isnan(rho_s) else 0.0
+    abs_a = abs(rho_a) if not np.isnan(rho_a) else 0.0
+    if abs_s > abs_a and rho_s < 0 and p_s < 0.05:
+        verdict = "PASS"
+    elif abs_s > rho_threshold and rho_s < 0 and abs_s <= abs_a:
+        verdict = "MARGINAL"
+    else:
+        verdict = "FAIL"
+    underpowered = n_s < 100
+
+    summary = {
+        "gene": gene,
+        "seed": int(seed),
+        "method": method,
+        "rho_steer": rho_s,
+        "p_steer": p_s,
+        "n_steer": n_s,
+        "rho_am": rho_a,
+        "p_am": p_a,
+        "n_am": n_a,
+        "rho_random": rho_r,
+        "p_random": p_r,
+        "n_random": n_r,
+        "verdict": verdict,
+        "underpowered": bool(underpowered),
+        "n_mave_loaded": int(len(mave_df)),
+        "atlas_best_reward": float(atlas.best_reward),
+        "atlas_n_iterations": int(atlas.n_iterations),
+    }
+    wandb.log({f"mave/{k}": v for k, v in summary.items() if isinstance(v, (int, float))})
+    wandb.log({"mave/verdict": verdict})
+    print("\n=== eval_atlas_mave summary ===")
+    print(json.dumps(summary, indent=2))
+    print(
+        "\nThreshold interpretation:\n"
+        f"  PASS      → |ρ_steer| {abs_s:.4f} > |ρ_AM| {abs_a:.4f}  "
+        f"AND ρ_steer ({rho_s:+.4f}) < 0  AND p_steer ({p_s:.4g}) < 0.05\n"
+        f"  MARGINAL  → |ρ_steer| > {rho_threshold} AND ρ_steer < 0 "
+        f"AND |ρ_steer| ≤ |ρ_AM|\n"
+        f"  FAIL      → otherwise\n"
+        f"  Verdict   → {verdict}{'  (UNDERPOWERED: n<100)' if underpowered else ''}"
+    )
+
+    out_dir = (
+        WEIGHTS_ROOT
+        / "runs"
+        / "steering"
+        / gene
+        / method
+        / f"seed_{seed}"
+    )
+    out_path = out_dir / "mave_eval.json"
+    out_path.write_text(json.dumps(summary, indent=2))
+    weights_volume.commit()
+    wandb.finish()
+    print(f"[eval_atlas_mave] wrote {out_path}")
+    return summary
 
 
 # ---------------------------------------------------------------------------
