@@ -508,99 +508,58 @@ def cache_mave(gene: str = "BRCA1", force: bool = False) -> str:
 
 
 @app.function(
-    gpu="A100-80GB",
     image=gpu_image,
     volumes={"/weights": weights_volume},
-    timeout=60 * 60,
-    secrets=[modal.Secret.from_name("huggingface")],
+    timeout=60 * 10,
 )
 def cache_mask_signs(
     gene: str = "BRCA1",
-    sequence_window: int = 512,
     force: bool = False,
 ) -> str:
     """
-    Refit the Phase-0 logistic probe under the same RNG Phase 0 used, recover
-    the signed coefficient for each feature in the saved mask, and persist a
-    sign-aligned artifact to
-    `/weights/runs/phase0/<gene>/mask_signs.json`.
+    Read the signed probe coefficient for each feature in the saved mask from
+    `probe.json` (written by Phase 0 since 2026-05-26) and persist a
+    sign-aligned artifact to `/weights/runs/phase0/<gene>/mask_signs.json`.
 
     Consumed by the `pathogenic_split` BO projection — splits the k=1000
     mask into pathogenic-positive vs pathogenic-negative subsets so a 2-D
-    BO can express "amplify one, suppress the other", which is the
-    hypothesis the uniform-1D projection couldn't.
+    BO can express "amplify one, suppress the other".
 
-    Sanity-checks that refit top-|coef| of size |mask| reproduces the
-    saved feature_ids set exactly. Mismatch ⇒ Phase 0 RNG drift; surface
-    instead of silently shipping a misaligned sign vector.
+    No GPU needed: reads coefficients directly from the serialised probe
+    rather than refitting. The saved probe.json is the canonical source of
+    truth (it IS the Phase-0 probe that produced feature_mask.json), so
+    sign extraction is exact and deterministic regardless of GPU
+    non-determinism in later re-runs.
     """
     import json
 
     import numpy as np
 
-    from causal_steering.data.clinvar import load_clinvar
-    from causal_steering.data.sequence import add_sequence_column
-    from causal_steering.models.evo2 import Evo2WithHook
     from causal_steering.models.probe import PathogenicityProbe
-    from causal_steering.models.sae import BatchTopKSAE
-    from causal_steering.utils.seeding import seed_everything
-
-    cache_weights.local(force=False)
-    cache_clinvar.local(force=False)
-    cache_reference.local(gene=gene)
 
     phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
     mask_path = phase0_dir / "feature_mask.json"
+    probe_path = phase0_dir / "probe.json"
     signs_path = phase0_dir / "mask_signs.json"
     assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
+    assert probe_path.exists(), (
+        f"missing {probe_path} — re-run phase0 (probe serialisation landed 2026-05-26)"
+    )
     if signs_path.exists() and not force:
         print(f"[cache_mask_signs] already cached at {signs_path}")
         return str(signs_path)
 
     feature_ids = PathogenicityProbe.load_mask(mask_path)
-    print(f"[cache_mask_signs] refit on {gene}, |mask|={len(feature_ids)}")
-
-    # Match Phase 0's RNG so probe coefs are deterministic with the saved mask.
-    seed_everything(0)
-
-    df = load_clinvar(str(CLINVAR_PATH), gene=gene)
-    df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=sequence_window)
-    assert len(df) > 0, "all variants dropped during sequence extraction"
-    sequences = df["sequence"].tolist()
-    labels = df["label"].to_numpy()
-    variant_idx = sequence_window
-    print(f"[cache_mask_signs] {len(df)} {gene} variants survived sequence extraction")
-
-    evo2 = Evo2WithHook(
-        model_name="evo2_7b_262k", local_path=None, device="cuda", block_index=26
-    )
-    sae = BatchTopKSAE(model_id=str(SAE_DIR), device="cuda")
-
-    feats: list[np.ndarray] = []
-    for seq in sequences:
-        hidden = evo2.get_activations([seq])
-        f = sae.encode(hidden)[0, variant_idx, :]
-        feats.append(f.cpu().float().numpy())
-    X = np.stack(feats, axis=0)
-
-    probe = PathogenicityProbe()
-    cv = probe.fit(X, labels, cv_folds=5)
+    probe = PathogenicityProbe.load(probe_path)
     assert probe._clf is not None
-    coefs_full = probe._clf.coef_[0]
+    coefs_full = np.array(probe._clf.coef_[0])
 
-    # Sanity vs saved mask.
-    refit_top = np.argsort(np.abs(coefs_full))[::-1][: len(feature_ids)].tolist()
-    refit_matches = set(refit_top) == set(feature_ids)
-    print(
-        f"[cache_mask_signs] refit AUC={cv['cv_auc_mean']:.3f}±{cv['cv_auc_std']:.3f}  "
-        f"top-{len(feature_ids)} ≡ saved mask: {refit_matches}"
-    )
-    if not refit_matches:
-        diff = set(refit_top) ^ set(feature_ids)
+    # Sanity: every feature_id must be within the probe's coefficient vector.
+    n_features_probe = len(coefs_full)
+    if max(feature_ids) >= n_features_probe:
         raise RuntimeError(
-            f"refit top-{len(feature_ids)} does not match saved mask "
-            f"(symmetric difference = {len(diff)} ids); "
-            "Phase 0 RNG drift — re-run Phase 0 before trusting these signs"
+            f"feature_id={max(feature_ids)} out of range for probe with "
+            f"n_features={n_features_probe}"
         )
 
     signs = [int(np.sign(coefs_full[fid])) for fid in feature_ids]
@@ -610,9 +569,6 @@ def cache_mask_signs(
         "n_pos": int(sum(s > 0 for s in signs)),
         "n_neg": int(sum(s < 0 for s in signs)),
         "n_zero": int(sum(s == 0 for s in signs)),
-        "refit_auc_mean": float(cv["cv_auc_mean"]),
-        "refit_auc_std": float(cv["cv_auc_std"]),
-        "refit_top_k_matches_saved": True,
     }
     signs_path.write_text(json.dumps(out, indent=2))
     weights_volume.commit()
@@ -1969,6 +1925,7 @@ def run_steering_bayesopt(
     """
     import json
 
+    import pandas as pd
     import wandb
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -1994,8 +1951,16 @@ def run_steering_bayesopt(
     phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
     mask_path = phase0_dir / "feature_mask.json"
     guard_path = phase0_dir / "guard.npz"
+    probe_path = phase0_dir / "probe.json"
     assert mask_path.exists(), f"missing {mask_path} — run phase0 first"
     assert guard_path.exists(), f"missing {guard_path} — run phase0 first"
+    # probe.json is required by `reward.kind=probe_variant` (default, see
+    # docs/decisions.md 2026-05-26). If absent, Phase 0 pre-dates the probe
+    # persistence change — re-run `modal run -m ...::phase0 --gene <gene>`.
+    assert probe_path.exists(), (
+        f"missing {probe_path} — re-run phase0 (probe persistence landed "
+        "2026-05-26)"
+    )
 
     # ---- Compose Hydra steering config + rewrite paths to Volume -------------
     overrides = [f"gene={gene}", f"seed={seed}", "method=bayesopt"]
@@ -2013,6 +1978,7 @@ def run_steering_bayesopt(
     cfg_dict["data"]["alphamissense_path"] = str(ALPHAMISSENSE_DIR / f"{gene}.parquet")
     cfg_dict["data"]["cadd_path"] = str(CADD_DIR / f"{gene}.tsv.gz")
     cfg_dict["feature_mask_path"] = str(mask_path)
+    cfg_dict["probe_path"] = str(probe_path)
     out_dir = WEIGHTS_ROOT / "runs" / "steering" / gene / "bayesopt" / f"seed_{seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg_dict["output_dir"] = str(out_dir)
@@ -2025,9 +1991,18 @@ def run_steering_bayesopt(
         signs_payload = json.loads(
             (phase0_dir / "mask_signs.json").read_text()
         )
+        if signs_payload["feature_ids"] != PathogenicityProbe.load_mask(mask_path):
+            print(
+                "[run_steering_bayesopt] mask_signs.json is stale (Phase 0 was re-run); "
+                "regenerating with force=True"
+            )
+            cache_mask_signs.local(gene=gene, force=True)
+            signs_payload = json.loads(
+                (phase0_dir / "mask_signs.json").read_text()
+            )
         assert signs_payload["feature_ids"] == PathogenicityProbe.load_mask(
             mask_path
-        ), "mask_signs.json feature_ids drifted from feature_mask.json"
+        ), "mask_signs.json feature_ids still drifted after force regeneration"
         cfg_dict["gp"]["signs"] = signs_payload["signs"]
         print(
             f"[run_steering_bayesopt] loaded {len(signs_payload['signs'])} signs "
@@ -2041,12 +2016,17 @@ def run_steering_bayesopt(
     if wandb.run is not None:
         wandb.run.tags = tuple(set(wandb.run.tags or ()) | {"bayesopt", f"seed_{seed}"})
 
-    # ---- Mask + guard ---------------------------------------------------------
+    # ---- Mask + guard + probe -------------------------------------------------
     feature_mask = PathogenicityProbe.load_mask(mask_path)
     guard = DistributionGuard.load(guard_path)
+    probe = None
+    if str(cfg.reward.get("kind", "probe_variant")) == "probe_variant":
+        probe = PathogenicityProbe.load(probe_path)
     print(
         f"[run_steering_bayesopt] gene={gene} seed={seed} "
-        f"|mask|={len(feature_mask)} guard.q=[{guard.q_low}, {guard.q_high}]"
+        f"|mask|={len(feature_mask)} guard.q=[{guard.q_low}, {guard.q_high}] "
+        f"reward.kind={cfg.reward.get('kind', 'probe_variant')} "
+        f"probe_loaded={probe is not None}"
     )
 
     # ---- Models ---------------------------------------------------------------
@@ -2058,10 +2038,14 @@ def run_steering_bayesopt(
     )
     sae = BatchTopKSAE(model_id=str(SAE_DIR), device=cfg.evo2.device)
 
-    # ---- Seed sequences + anchors --------------------------------------------
+    # ---- Seed sequences + anchors (balanced pathogenic/benign panel) ----------
     # `add_sequence_column` slices forward-strand chromosomal windows of
     # length 2*window+1 centred on each variant; the anchor for seed[0] is
     # therefore always strand="+" and start = pos - window (1-based genomic).
+    #
+    # Balance: take n_half from each class so the differential reward
+    # `mean P(patho_seeds) − mean P(benign_seeds)` has equal weight on both
+    # sides and can't be maximised by purely pushing all predictions up.
     window = int(cfg.data.sequence_window)
     df = load_clinvar(str(CLINVAR_PATH), gene=gene)
     df = add_sequence_column(df, fasta_root=REFERENCE_DIR, window=window)
@@ -2073,21 +2057,31 @@ def run_steering_bayesopt(
             f"edge={df.attrs.get('n_edge')}, "
             f"non_snv={df.attrs.get('n_non_snv')})"
         )
-    assert len(df) >= n_seed_sequences, (
-        f"only {len(df)} {gene} variants survived sequence extraction; "
-        f"need at least {n_seed_sequences} for the steering loop"
+    n_half = n_seed_sequences // 2
+    patho_df = df[df["label"] == 1].head(n_half).reset_index(drop=True)
+    benign_df = df[df["label"] == 0].head(n_half).reset_index(drop=True)
+    n_use = min(len(patho_df), len(benign_df))
+    assert n_use > 0, (
+        f"need at least 1 variant of each ClinVar class for {gene}; "
+        f"got patho={len(patho_df)} benign={len(benign_df)}"
     )
-    df = df.head(n_seed_sequences).reset_index(drop=True)
-
-    seed_sequences = df["sequence"].tolist()
+    seed_df = pd.concat([patho_df.head(n_use), benign_df.head(n_use)]).reset_index(drop=True)
+    seed_sequences = seed_df["sequence"].tolist()
+    seed_labels = seed_df["label"].tolist()
     seed_anchors = [
         SeedAnchor(
             chrom=_normalize_chrom(str(row["chrom"])),
             start=int(row["pos"]) - window,
             strand="+",
         )
-        for _, row in df.iterrows()
+        for _, row in seed_df.iterrows()
     ]
+    print(
+        f"[run_steering_bayesopt] seed panel: "
+        f"{sum(l == 1 for l in seed_labels)} pathogenic / "
+        f"{sum(l == 0 for l in seed_labels)} benign  "
+        f"(labels={seed_labels})"
+    )
 
     # ---- Run the loop ---------------------------------------------------------
     trajectory, atlas = run_steering_loop(
@@ -2098,6 +2092,8 @@ def run_steering_bayesopt(
         guard=guard,
         seed_sequences=seed_sequences,
         seed_anchors=seed_anchors,
+        probe=probe,
+        seed_labels=seed_labels,
     )
 
     # ---- Persist artifacts ----------------------------------------------------
@@ -2148,6 +2144,7 @@ def eval_atlas_mave(
     batch_size: int = 25,
     consequence_filter: str | None = None,
     rho_threshold: float = 0.10,
+    reward_kind: str | None = None,
 ) -> dict:
     """
     Week 4 go/no-go: held-out MAVE Spearman against a trained atlas.
@@ -2199,6 +2196,7 @@ def eval_atlas_mave(
     from causal_steering.data.sequence import _normalize_chrom, variant_to_sequence
     from causal_steering.eval.atlas import CausalAtlas
     from causal_steering.eval.fast_reward import SeedAnchor, compute_fast_reward
+    from causal_steering.eval.probe_reward import compute_probe_reward
     from causal_steering.models.evo2 import Evo2WithHook
     from causal_steering.models.probe import PathogenicityProbe
     from causal_steering.models.sae import BatchTopKSAE
@@ -2218,20 +2216,33 @@ def eval_atlas_mave(
     phase0_dir = WEIGHTS_ROOT / "runs" / "phase0" / gene
     mask_path = phase0_dir / "feature_mask.json"
     guard_path = phase0_dir / "guard.npz"
-    atlas_path = (
-        WEIGHTS_ROOT
-        / "runs"
-        / "steering"
-        / gene
-        / method
-        / f"seed_{seed}"
-        / "atlas.json"
-    )
+    probe_path = phase0_dir / "probe.json"
+    run_dir = WEIGHTS_ROOT / "runs" / "steering" / gene / method / f"seed_{seed}"
+    atlas_path = run_dir / "atlas.json"
+    traj_path = run_dir / "trajectory.json"
     mave_path = MAVE_DIR / f"{gene}.parquet"
     assert atlas_path.exists(), f"missing {atlas_path} — run the steering loop first"
     assert mask_path.exists(), f"missing {mask_path}"
     assert guard_path.exists(), f"missing {guard_path}"
     assert mave_path.exists(), f"missing {mave_path} — cache_mave failed"
+
+    # If `reward_kind` is unspecified, read it off the trajectory the atlas
+    # was built from — every iter record carries `reward_kind` since the
+    # 2026-05-26 ADR landed. Old trajectories (pre-ADR) lack the field; in
+    # that case we default to `downstream_diff` for back-compat with the
+    # Week-4 broken-reward run.
+    if reward_kind is None:
+        try:
+            with open(traj_path) as f:
+                first = json.load(f)
+            reward_kind = str(first[0].get("reward_kind", "downstream_diff"))
+        except (FileNotFoundError, IndexError, KeyError):
+            reward_kind = "downstream_diff"
+    if reward_kind not in ("probe_variant", "downstream_diff"):
+        raise ValueError(
+            f"unknown reward_kind={reward_kind!r}; expected probe_variant or downstream_diff"
+        )
+    print(f"[eval_atlas_mave] predictor = reward_kind={reward_kind!r}")
 
     # ---- Compose Hydra config for reward weights + paths ---------------------
     with initialize_config_dir(config_dir="/configs", version_base=None):
@@ -2329,9 +2340,29 @@ def eval_atlas_mave(
         dtype=torch.double,
     )
 
+    probe = None
+    if reward_kind == "probe_variant":
+        assert probe_path.exists(), (
+            f"missing {probe_path} — re-run phase0 to persist probe.json "
+            "(landed 2026-05-26)"
+        )
+        probe = PathogenicityProbe.load(probe_path)
+        print(f"[eval_atlas_mave] probe loaded from {probe_path}")
+
+    variant_idx = int(cfg.data.sequence_window)
+
     def _per_variant_rewards(steering_vec: torch.Tensor, label: str) -> list[float]:
-        """Generate steered + unsteered for every MAVE variant and compute
-        per-variant fast reward. Batched over seeds for throughput."""
+        """Per-MAVE-variant predictor under the atlas's training reward kind.
+
+        `probe_variant` → run one patched forward per seed, read variant-
+        position SAE features, call probe.predict_proba_pathogenic. This is
+        the same predictor the steering loop optimised against, so the MAVE
+        Spearman tests whether the trained policy generalises to held-out
+        Findlay variants under the *same* signal.
+
+        `downstream_diff` → legacy AM+CADD-on-diff predictor; preserved so
+        the Week-4 Goodhart-exposed run is reproducible at eval time.
+        """
         rewards: list[float] = []
         patch_fn, _clip_rates = make_patch_fn(
             sae_encode=sae.encode,
@@ -2345,23 +2376,38 @@ def eval_atlas_mave(
             end = min(start + batch_size, n)
             batch_seeds = seeds[start:end]
             batch_anchors = anchors[start:end]
-            steered = evo2.generate_with_patch(
-                seed_sequences=batch_seeds,
-                patch_fn=patch_fn,
-                max_new_tokens=max_new_tokens,
-                temperature=0,
-            )
-            unsteered = evo2.generate_with_patch(
-                seed_sequences=batch_seeds,
-                patch_fn=None,
-                max_new_tokens=max_new_tokens,
-                temperature=0,
-            )
-            for seed_seq, gen, base, anchor in zip(
-                batch_seeds, steered, unsteered, batch_anchors, strict=True
-            ):
-                r = compute_fast_reward(cfg, seed_seq, gen, base, anchor)
-                rewards.append(r["reward"])
+            if reward_kind == "probe_variant":
+                assert probe is not None
+                # `compute_probe_reward` iterates the batch internally; we
+                # call it with the whole slice so the per-seed P(pathogenic)
+                # ordering matches `batch_seeds`.
+                result = compute_probe_reward(
+                    evo2=evo2,
+                    sae=sae,
+                    probe=probe,
+                    sequences=batch_seeds,
+                    variant_idx=variant_idx,
+                    patch_fn=patch_fn,
+                )
+                rewards.extend(result["p_pathogenic"])
+            else:  # downstream_diff (legacy)
+                steered = evo2.generate_with_patch(
+                    seed_sequences=batch_seeds,
+                    patch_fn=patch_fn,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0,
+                )
+                unsteered = evo2.generate_with_patch(
+                    seed_sequences=batch_seeds,
+                    patch_fn=None,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0,
+                )
+                for seed_seq, gen, base, anchor in zip(
+                    batch_seeds, steered, unsteered, batch_anchors, strict=True
+                ):
+                    r = compute_fast_reward(cfg, seed_seq, gen, base, anchor)
+                    rewards.append(r["reward"])
             print(
                 f"[{label}] batch {start // batch_size + 1}/"
                 f"{(n + batch_size - 1) // batch_size}: "
@@ -2423,6 +2469,7 @@ def eval_atlas_mave(
         "gene": gene,
         "seed": int(seed),
         "method": method,
+        "reward_kind": reward_kind,
         "rho_steer": rho_s,
         "p_steer": p_s,
         "n_steer": n_s,
