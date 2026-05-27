@@ -9,7 +9,12 @@ from causal_steering.eval.fast_reward import (
     compute_fast_reward,
     unsteered_greedy,
 )
+from causal_steering.eval.probe_reward import (
+    compute_probe_reward,
+    probe_variant_baseline_for_panel,
+)
 from causal_steering.models.evo2 import Evo2WithHook
+from causal_steering.models.probe import PathogenicityProbe
 from causal_steering.models.sae import BatchTopKSAE
 from causal_steering.steering.guard import DistributionGuard
 from causal_steering.steering.patch import make_patch_fn
@@ -26,6 +31,8 @@ def run_steering_loop(
     guard: DistributionGuard,
     seed_sequences: list[str],
     seed_anchors: list[SeedAnchor],
+    probe: PathogenicityProbe | None = None,
+    seed_labels: list[int] | None = None,
 ) -> tuple[list[dict], CausalAtlas]:
     """
     Pure orchestrator: (cfg, mask, models, seed_sequences, anchors) →
@@ -33,12 +40,29 @@ def run_steering_loop(
     updated here.
 
     `seed_anchors[i]` pins `seed_sequences[i][0]` to a (chrom, pos, strand)
-    so per-iter reward calls can resolve the steered-vs-unsteered diff to
-    forward-strand genomic coords for AM/CADD lookup.
+    so the legacy `downstream_diff` reward can resolve the steered-vs-
+    unsteered diff to forward-strand genomic coords for AM/CADD lookup.
+    Under `cfg.reward.kind == "probe_variant"` (default per
+    docs/decisions.md 2026-05-26) the anchors are unused inside the loop;
+    they are still required because the caller assembles them anyway and
+    a future eval slice may want them.
+
+    `probe` must be provided when `cfg.reward.kind == "probe_variant"`.
     """
     assert len(seed_anchors) == len(seed_sequences), (
         "seed_anchors must align 1:1 with seed_sequences"
     )
+    if seed_labels is not None:
+        assert len(seed_labels) == len(seed_sequences), (
+            "seed_labels must align 1:1 with seed_sequences"
+        )
+    reward_kind = str(cfg.reward.get("kind", "probe_variant"))
+    if reward_kind == "probe_variant" and probe is None:
+        raise ValueError(
+            "reward.kind=probe_variant requires `probe` — load it from "
+            "runs/phase0/<gene>/probe.json and pass into run_steering_loop"
+        )
+
     seed_everything(cfg.seed)
     signs_cfg = cfg.gp.get("signs")
     policy = GPSteeringPolicy(
@@ -50,22 +74,68 @@ def run_steering_loop(
         signs=list(signs_cfg) if signs_cfg is not None else None,
     )
 
-    # Unsteered greedy baseline per seed, computed once and reused across iters.
+    # Variant position: same convention as Phase 0 and the seed-window slice
+    # (see data/sequence.py::add_sequence_column). For probe_variant this is
+    # the index whose SAE features go to the probe.
+    variant_idx = int(cfg.data.sequence_window)
+
+    # Per-reward-kind setup. `downstream_diff` needs the unsteered greedy
+    # baseline cached up-front; `probe_variant` has no generation tail.
     unsteered_cache: dict[str, str] = {}
     unsteered: list[str] = []
-    for seed in seed_sequences:
-        unsteered.append(
-            unsteered_greedy(
-                seed,
-                cfg.evo2.max_new_tokens,
-                generate=lambda s=seed: evo2.generate_with_patch(
-                    seed_sequences=[s],
-                    patch_fn=None,
-                    max_new_tokens=cfg.evo2.max_new_tokens,
-                    temperature=0,
-                )[0],
-                cache=unsteered_cache,
+    if reward_kind == "downstream_diff":
+        for seed in seed_sequences:
+            unsteered.append(
+                unsteered_greedy(
+                    seed,
+                    cfg.evo2.max_new_tokens,
+                    generate=lambda s=seed: evo2.generate_with_patch(
+                        seed_sequences=[s],
+                        patch_fn=None,
+                        max_new_tokens=cfg.evo2.max_new_tokens,
+                        temperature=0,
+                    )[0],
+                    cache=unsteered_cache,
+                )
             )
+    elif reward_kind == "probe_variant":
+        # Algebraic identity check: at scale=ones the patch is a no-op so the
+        # baseline equals the Phase-0 probe's call on each unsteered variant.
+        # Logged so the inner loop is auditable against the Phase 0 AUC.
+        assert probe is not None  # type-narrow for the runtime check above
+        baseline = probe_variant_baseline_for_panel(
+            evo2=evo2,
+            sae=sae,
+            probe=probe,
+            sequences=seed_sequences,
+            variant_idx=variant_idx,
+        )
+        _bl_p = baseline["p_pathogenic"]
+        if seed_labels is not None:
+            _bl_pos = [p for p, l in zip(_bl_p, seed_labels) if l == 1]
+            _bl_neg = [p for p, l in zip(_bl_p, seed_labels) if l == 0]
+            _bl_diff = float(sum(_bl_pos) / len(_bl_pos)) - float(sum(_bl_neg) / len(_bl_neg))
+            wandb.log({
+                "probe/baseline_reward": _bl_diff,
+                "probe/baseline_p_patho_mean": float(sum(_bl_pos) / len(_bl_pos)),
+                "probe/baseline_p_benign_mean": float(sum(_bl_neg) / len(_bl_neg)),
+            })
+            print(
+                f"[loop] probe baseline (unsteered, differential): "
+                f"P(patho_seeds)={sum(_bl_pos)/len(_bl_pos):.4f}  "
+                f"P(benign_seeds)={sum(_bl_neg)/len(_bl_neg):.4f}  "
+                f"diff={_bl_diff:.4f}"
+            )
+        else:
+            wandb.log({"probe/baseline_reward": baseline["reward"]})
+            print(
+                f"[loop] probe baseline (unsteered): "
+                f"mean P(pathogenic)={baseline['reward']:.4f} "
+                f"per-seed={baseline['p_pathogenic']}"
+            )
+    else:
+        raise ValueError(
+            f"unknown reward.kind={reward_kind!r}; expected probe_variant or downstream_diff"
         )
 
     trajectory: list[dict] = []
@@ -87,21 +157,44 @@ def run_steering_loop(
             guard_clip=guard.clip,
         )
 
-        generated = evo2.generate_with_patch(
-            seed_sequences=seed_sequences,
-            patch_fn=patch_fn,
-            max_new_tokens=cfg.evo2.max_new_tokens,
-            temperature=0,
-        )
-
-        per_seed = [
-            compute_fast_reward(cfg, seed, gen, base, anchor)
-            for seed, gen, base, anchor in zip(
-                seed_sequences, generated, unsteered, seed_anchors, strict=True
+        if reward_kind == "probe_variant":
+            assert probe is not None
+            result = compute_probe_reward(
+                evo2=evo2,
+                sae=sae,
+                probe=probe,
+                sequences=seed_sequences,
+                variant_idx=variant_idx,
+                patch_fn=patch_fn,
             )
-        ]
-        rewards = [r["reward"] for r in per_seed]
-        reward = float(sum(rewards) / len(rewards))
+            p_pos = result["p_pathogenic"]
+            if seed_labels is not None:
+                p_patho = [p for p, l in zip(p_pos, seed_labels) if l == 1]
+                p_benign = [p for p, l in zip(p_pos, seed_labels) if l == 0]
+                reward = (
+                    float(sum(p_patho) / len(p_patho)) - float(sum(p_benign) / len(p_benign))
+                    if p_patho and p_benign else float(sum(p_pos) / len(p_pos))
+                )
+            else:
+                reward = float(result["reward"])
+            per_seed_extras = {"p_pathogenic": p_pos}
+        else:  # downstream_diff
+            generated = evo2.generate_with_patch(
+                seed_sequences=seed_sequences,
+                patch_fn=patch_fn,
+                max_new_tokens=cfg.evo2.max_new_tokens,
+                temperature=0,
+            )
+            per_seed = [
+                compute_fast_reward(cfg, seed, gen, base, anchor)
+                for seed, gen, base, anchor in zip(
+                    seed_sequences, generated, unsteered, seed_anchors, strict=True
+                )
+            ]
+            rewards = [r["reward"] for r in per_seed]
+            reward = float(sum(rewards) / len(rewards))
+            per_seed_extras = {"per_seed": per_seed}
+
         clip_rate = float(sum(clip_rates) / len(clip_rates)) if clip_rates else 0.0
 
         policy.update(reward)
@@ -112,6 +205,9 @@ def run_steering_loop(
             "clip_rate": clip_rate,
             "steering_vec": steering_vec.tolist(),
             "elapsed": time.time() - t0,
+            "reward_kind": reward_kind,
+            "differential_reward": seed_labels is not None,
+            **per_seed_extras,
         }
         trajectory.append(record)
 
