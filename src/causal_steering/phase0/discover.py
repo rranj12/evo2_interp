@@ -138,7 +138,13 @@ def run_phase0(cfg: dict[str, Any]) -> dict[str, Any]:
     mask_path = out_dir / "feature_mask.json"
     probe.save_mask(mask_path, k=cfg_oc.probe.feature_mask_size)
     guard.save(out_dir / "guard.npz")
+    # Persist the fitted probe so the steering loop's per-variant reward
+    # (`reward.kind=probe_variant`) can call predict_proba without refitting.
+    # See docs/decisions.md 2026-05-26 — the probe is now in-loop, not just
+    # the mask-selection oracle. The mask file still drives the action space.
+    probe_path = out_dir / "probe.json"
+    probe.save(probe_path)
     print(f"Outputs written to {out_dir}")
     wandb.finish()
 
-    return {"status": "ok", "mask_path": str(mask_path), **metrics}
+    return {"status": "ok", "mask_path": str(mask_path), "probe_path": str(probe_path), **metrics}

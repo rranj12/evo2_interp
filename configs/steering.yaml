@@ -8,4 +8,5 @@ defaults:
 method: bayesopt
 
 feature_mask_path: runs/phase0/${gene}/feature_mask.json
+probe_path: runs/phase0/${gene}/probe.json
 output_dir: runs/steering/${gene}/${method}/seed_${seed}
