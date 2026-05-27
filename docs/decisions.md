@@ -2,6 +2,130 @@
 
 One-paragraph notes on locked decisions. Newest first.
 
+## 2026-05-26 (follow-up) — Differential reward + pre-registered MAVE threshold for run 3
+
+**Problem (run 2 post-mortem).** `probe_variant` with `pathogenic_split` / `search_dim=2`
+raised training reward 0.68 → 0.92 but dropped ρ_steer from −0.299 to −0.274 (below the
+random-permutation baseline −0.286). `mean P(pathogenic)` is a *level* not a
+*discriminator*: BO found a steering vector that pushes **all** predictions toward 1.0,
+maximising the mean without preserving rank-order. This is the Goodhart failure the
+two-tier eval exists to catch.
+
+**Fix: differential reward.** Replace `mean P(pathogenic)` with
+`mean P(patho_seeds) − mean P(benign_seeds)`. The reward is high only when the steering
+vector selectively amplifies pathogenicity signal for the pathogenic seeds while leaving
+(or suppressing) the benign seeds. The algebraic identity property at `scale=ones` still
+holds: the baseline differential equals the Phase-0 probe's per-class means on the
+unsteered panel, logged once before the loop.
+
+**Required change: balanced seed panel.** `n_half = n_seed_sequences // 2` variants from
+each ClinVar class. Equal class balance prevents a globally high-or-low probe from
+gaming the differential. Seed labels are logged to W&B for auditability.
+
+**Pre-registered MAVE threshold (locked before run 3 dispatch).**
+Prior best: ρ_steer = −0.299 (run 1). AM ceiling: ρ_AM = −0.5615. Random baseline: −0.286.
+Gap to AM ceiling from best: 0.263.
+
+| Verdict  | Condition                                                                        |
+|----------|----------------------------------------------------------------------------------|
+| PASS     | \|ρ_steer\| ≥ 0.35  AND  ρ_steer < ρ_random  AND  p_steer < 0.001              |
+| MARGINAL | 0.30 ≤ \|ρ_steer\| < 0.35  AND  ρ_steer < ρ_random − 0.01  AND  p < 0.05      |
+| FAIL     | otherwise                                                                        |
+
+PASS requires clearing >20% of the gap to the AM ceiling from the best prior run,
+a stronger-than-noise improvement over baseline, and a significance threshold that rules
+out lucky permutation. MARGINAL = directionally correct but not decisive. FAIL = run 2
+regime again.
+
+## 2026-05-26 — Reward reformulation: score the variant, not the downstream-diff SNVs
+
+Week 4 BO ran to completion against the AM+CADD downstream-diff reward
+(`eval/fast_reward.py::compute_fast_reward`) and converged — but the held-out
+MAVE Spearman eval (`utils.modal_app::eval_atlas_mave`) showed the trained
+policy generalised the *fast signal*, not BRCA1 function: AM+CADD reward
+climbed on the train seeds while ρ_steer vs Findlay 2018 was at-or-below
+the AM-only baseline. This is the canonical Goodhart failure the two-tier
+eval was designed to surface (CLAUDE.md "Don't collapse fast and ground
+truth"); the gate did its job — the optimizer optimized the proxy. The
+proxy itself, not the optimizer, is the failure point: the downstream-diff
+reward measures *whether AM+CADD would call the steered SNV set pathogenic*
+on positions that are 1–512 bp downstream of the variant we actually care
+about. There is no algebraic link between "AM scores the generated tail
+SNVs as pathogenic" and "the variant-position activation has moved across
+the probe's pathogenicity boundary"; BO is free to find steering vectors
+that hallucinate downstream pathogenic-looking SNVs without touching the
+variant-position representation at all. That is exactly what it did.
+
+**The bar is real and clearable in principle.** Phase 0 produced a
+probe with CV-AUC 0.905 ± 0.026 on the per-variant-position SAE feature
+vector — i.e., when you read the SAE features at the variant index, the
+pathogenic/benign signal is sitting right there, already linearly
+separable. The Week 4 BO arm was hill-climbing the wrong scalar; the
+signal it was meant to discover was always one matmul away from the
+state the patch already produces.
+
+**Reformulation (locks here):** the reward is the probe's prediction on
+the *variant-position SAE features after steering*, not the
+AM+CADD-scored diff of the generated tail. Per iter, for each seed
+sequence in the panel: run the patched forward through Evo 2 → read
+block-26 activations at the variant index → SAE-encode → call
+`probe.predict_proba(...)[:, 1]` → average across the panel. BO trains
+directly on this. No generation tail, no SNV diff, no AM/CADD lookup in
+the inner loop. AM/CADD remain part of the artifact set (we still cache
+them for `eval_atlas_mave`'s AM-only baseline column) but they are no
+longer reward signal. MAVE remains the held-out ground truth — the
+two-tier eval survives intact; only the fast tier is replaced.
+
+**Why this is the "causal feature atlas" semantics the project promised.**
+The atlas's contract is feature → causal effect on pathogenicity. The
+probe is *the operationalisation of "pathogenicity"* this project chose
+back in Phase 0. Scoring the probe directly on steered features is the
+literal evaluation of that contract; the downstream-diff reward was a
+Week-3 plumbing artefact (it predates Phase 0's full integration) that
+substituted "AM thinks the tail looks pathogenic" for the actual
+semantic. Two algebraic properties the new reward inherits from the
+delta-patch infrastructure (see 2026-05-19 follow-up #1): (i) at
+`scale=ones(|mask|)` the patch is a byte-identical no-op on the residual
+stream, so re-encoded SAE features at the variant index equal the
+unsteered features and the reward equals the Phase 0 probe's call on
+that variant — i.e., scale=1.0 is the *true neutral point* of search,
+and the no-steering reward is exactly what the Phase 0 AUC promised was
+sitting there; (ii) the probe is fit on the same per-variant-position
+feature vectors the patched forward now exposes, so there is no
+train/eval distribution shift between Phase 0 and the steering inner
+loop (the prior downstream-diff reward had no such match — AM/CADD score
+hypothetical *neighbours* of the variant, not the variant itself).
+
+**Code-level impact.** (a) `models/probe.py` gains `save()` / `load()`
+that persist `coef_`, `intercept_`, `classes_` to JSON so the steering
+loop can call `predict_proba` without re-fitting. (b) `phase0/discover.py`
+writes `probe.json` next to `feature_mask.json` and `guard.npz`.
+(c) New module `eval/probe_reward.py` exposes
+`compute_probe_reward(evo2, sae, probe, seed, patch_fn, variant_idx)
+→ {reward, p_pathogenic}` — runs one patched forward, reads the
+variant-position SAE features, calls the probe. (d) `steering/loop.py`
+becomes reward-kind aware via `cfg.reward.kind ∈ {downstream_diff,
+probe_variant}`; default flips to `probe_variant` for new runs.
+`downstream_diff` is preserved (not deleted) so the failed Week-4 run is
+reproducible from this commit forward — it is the ADR's primary
+artefact. (e) `run_steering_bayesopt` and `scripts/run_steering.py` load
+`probe.json` and pass it through. The seed-anchor / AM / CADD plumbing
+stays in place for the (still-default-in-eval) AM-only baseline column
+in `eval_atlas_mave`, but is unused in the inner loop under the new
+reward kind.
+
+**What the next BO run must clear.** (i) Identity sanity: with
+`steering_vector = ones`, mean probe prediction across the Phase-0 panel
+must equal the Phase-0 probe's mean prediction on that panel within
+floating-point. (ii) Baseline floor: BO's *first-iter* reward (warmup
+sample 0) on a pathogenic-labeled panel must exceed 0.5 — the probe
+already calls pathogenic-labeled variants pathogenic, so the optimizer
+starts above chance with zero steering; if it doesn't, the activation
+pipeline is broken before BO. (iii) MAVE Spearman: |ρ_steer| > |ρ_AM|
+*and* ρ_steer is in the expected direction *and* p < 0.05 on Findlay
+2018 — same pre-committed verdict as the prior gate. (i) and (ii) are
+algebraic / definitional; (iii) is the real test.
+
 ## 2026-05-19 — Week 4 gate reframed: delta-patch specificity, not substitute-form recon stability
 
 First version of the Week 4 prerequisite gate
