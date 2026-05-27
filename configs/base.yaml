@@ -53,6 +53,13 @@ acquisition:
   xi: 0.01
 
 reward:
+  # `probe_variant` — score the variant-position SAE features under the patch
+  # through the Phase-0 probe. `downstream_diff` — the legacy AM+CADD-on-diff
+  # reward that was Goodhart-exposed at the Week 4 MAVE gate. See
+  # docs/decisions.md 2026-05-26. `downstream_diff` is preserved (not deleted)
+  # so the failed run is reproducible from the same code.
+  kind: probe_variant
+  # Legacy `downstream_diff` weights — unused under `kind: probe_variant`.
   am_weight: 0.5
   cadd_weight: 0.5
 
